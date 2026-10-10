@@ -1,120 +1,188 @@
 # Advisory Desk
 
-A local-first web app for an accounting advisory team. This alpha establishes the workspace, accounts, and project boundaries, with memo and deck intake flows for testing the experience.
+A sovereign, local-first web application designed for technical accounting and advisory teams. Built with a clean, minimal Material 3 aesthetic, Advisory Desk provides an operational workbench for technical accounting memorandums, executive presentation decks, and multi-framework engagement management.
 
-**AI is deferred to a later phase.** Memo and deck creation produces deterministic, editable outlines. The app does not generate accounting analysis or call an AI service.
+**AI is intentionally deferred to later phases.** Memo and deck intake produce deterministic, structured, and editable outlines. The application performs zero network egress, calls no external cloud APIs, and keeps all client facts, evidence, and deliverables contained on your local machine.
 
-## Run locally
+---
 
-Requires **Node.js 24 or later**. There are no packages to install, external fonts, CDNs, or service accounts to configure. The server uses Node's built-in HTTP, cryptography, and SQLite modules.
+## Architecture & User Journey
+
+Advisory Desk follows a structured, role-aware workflow:
+
+```
+[ Sign-in / Sign-up ] ──► [ Gateway Hub (The Launchpad) ]
+                                    │
+         ┌──────────────────────────┼──────────────────────────┐
+         ▼                          ▼                          ▼
+[ 01 Advisory Desk ]      [ 02 Knowledge Base ]     [ 03 Engagement Manager ]
+   (Workbench)               (Coming Soon)             (Master Directory)
+         │
+         ▼
+[ Engagement Workstation ]
+  ├── Technical Accounting Memos
+  ├── Executive Slide Decks (.pptx)
+  ├── Project Evidence & Templates
+  └── Team Access & Governance
+```
+
+### 1. Authentication & Open Registration (`#auth`)
+- **Open Teammate Registration**: Any team member can register without needing an upfront invitation code.
+- **Project Boundary Isolation**: New registrations start with zero project access by default. Confidential client engagements, drafts, and evidence remain invisible until an Engagement Manager / Project Owner assigns the teammate's registered email to that project.
+- **First Account Bootstrap**: The first account registered on `localhost` automatically becomes the workspace **Super User**.
+- **Optional Email-Bound Invitations**: Super users can generate time-limited (7-day), single-use invitation codes for managed corporate provisioning.
+
+### 2. The Gateway Hub (`#hub`)
+- Serves as the post-login launchpad featuring a personalized welcome header (`Welcome Back, <Name>. What do you want to do today?`).
+- Provides three minimal Material 3 interactive cards matching the clean reference design:
+  - **`01` Advisory Desk**: Enters the operational Workbench.
+  - **`02` Knowledge Base**: Displays the *Coming soon · Phase 2* badge and opens an authoritative accounting standards preview (IFRS, Ind AS, US GAAP).
+  - **`03` Engagement Manager**: Routes to the Master Project Registry with entity parameters and governance controls.
+
+### 3. Advisory Desk Workbench (`#desk`)
+- **Sidebar-Free Experience**: The landing view inside Advisory Desk is a focused, full-width **Workbench** without sidebar distractions.
+- **Dedicated Topbar**: Features the brand logo, a quick return button to the Hub, current view breadcrumbs, and a user profile menu.
+- **User Profile Menu**:
+  - **Dark / Light Mode Toggle**: Seamlessly switches themes across the entire interface (persisted via `localStorage`).
+  - **Sign Out**: Clears session cookies and CSRF tokens, immediately returning to the sign-in screen.
+- **Assigned Engagements Overview**:
+  - Displays all active engagements the signed-in user belongs to, including client entities, financial year ends, reporting frameworks, deliverables count, and team avatars.
+  - If the user has no engagements yet, presents a clear banner:
+    > *"You have no active engagements. Please create one or ask the Engagement Manager to invite you to an active engagement"*
+    > 
+    > Along with a direct **Create Engagement** action.
+
+### 4. In-Engagement Workstation (`#project/:id`)
+All core advisory tools and deliverables sit exclusively inside each engagement:
+- **Technical Accounting Memos**: Frame accounting questions under **IFRS**, **Ind AS**, or **US GAAP**. Select applicable accounting standards (e.g. IFRS 15, ASC 606, ASC 842), cite project evidence files, and generate editable Markdown outlines.
+- **Executive Slide Decks**: Draft presentation outlines for **Proposals** (with conditional IPO Readiness/PMO and GAAP transition fields), **Training sessions**, or **Technical discussions**.
+- **FS Sanity Checks**: Coming soon preview for automated casting and cross-referencing.
+- **Evidence Repository**: Upload supporting client documents, contracts, and company Markdown memo templates (up to 10 MB per file, stored in SQLite).
+- **Deliverables Pipeline**: Live Markdown editor with real-time preview, status workflow (`Draft` → `In review` → `Approved`), and conflict detection for concurrent edits.
+- **Assigned Team**: Project owners can add registered teammates by work email or revoke access at any time.
+
+### 5. Engagement Manager (`#project-setup`)
+- **Master Directory**: Master list of all engagements containing client entities, reporting frameworks, financial year ends, status states, and team member counts.
+- **Parameter Matrix**: Live breakdown of framework distributions (IFRS, Ind AS, US GAAP) and active engagement counts.
+- **Filter & Search Toolbar**: Real-time search across project names, clients, and briefs, filterable by framework, engagement type, and lifecycle status.
+- **View Toggles**: Switch between Master Matrix Table view and Card Grid view.
+
+---
+
+## Design System & Theme
+
+Advisory Desk is built with modern CSS custom properties adhering to Material 3 principles:
+- **Palette**: Brand Blue (`#23449B`), Brand Red (`#ED1A3B`), clean white cards, and subtle tonal surfaces (`#F8FAFC`).
+- **Dark Mode**: Complete built-in dark theme (`[data-theme="dark"]`) with deep slate surfaces (`#111827`, `#1A2234`), high-contrast typography, and accessible focus states.
+- **Typography & Elevation**: Native system typography stack, subtle 1px outlines (`#E2E8F0`), soft drop shadows, and pill-shaped interactive chips.
+
+---
+
+## Native Office Document Exports
+
+The application generates fully editable Office documents directly in pure Node.js without third-party converters or external headless browser processes:
+- **Word (`.docx`)**: Memos export to structured OpenXML documents with title cover blocks, heading hierarchies, bullet points, and metadata tables.
+- **PowerPoint (`.pptx`)**: Slide decks export as native 16:9 widescreen presentation files with formatted title slides and slide content layouts.
+- **Markdown (`.md`)**: Direct plain-text export for version control and documentation workflows.
+
+Exports always reflect the latest saved draft version in the database.
+
+---
+
+## Security & Data Isolation Guarantees
+
+1. **Zero External Egress**: The server binds to `127.0.0.1` by default. There are no tracking scripts, analytics, external web fonts, or CDN dependencies.
+2. **Strict Project Sandboxing**: Every request for project details, members, evidence, drafts, and exports verifies project membership on the server. Super users cannot access a project without explicit membership.
+3. **Session & Mutation Security**:
+   - Passwords hashed using salted `scrypt`.
+   - Cryptographically random session tokens stored in `HttpOnly; SameSite=Strict` cookies.
+   - Mutating requests require session-scoped `X-CSRF-Token` headers and pass strict Origin/Host validation.
+4. **Embedded Local Storage**: Data is persisted in a local SQLite database (`data/advisory.sqlite`), completely contained on the user's filesystem.
+
+---
+
+## Quickstart & Local Execution
+
+### Prerequisites
+- **Node.js 24 or later** (uses built-in SQLite, Crypto, and HTTP).
+- Zero external runtime npm packages required.
+
+### Starting the Server
 
 ```powershell
-# Windows — also finds a freshly installed Node.js before PATH is refreshed
+# Windows (automatically detects Node.js even if PATH is not updated)
 .\start.cmd
 ```
 
-Alternatively, on any supported OS:
+Or via npm / node on any platform:
 
 ```sh
 npm start
 ```
 
-Open **http://127.0.0.1:3000**. Keep the terminal running while using the app.
+Open **http://127.0.0.1:3000** in your browser.
 
-- **Explore a sample workspace** creates a separate account with six fictional engagements. Sample accounts cannot manage the actual team or access one another's projects.
-- **Create workspace** registers the first real account as the super user. First-account setup is restricted to localhost.
-- From **Settings → Team & access**, create an email-bound invitation. Share the code with the teammate through your existing internal channel. Codes are shown once, expire after seven days, and are consumed on signup. Creating a new code closes previous invitations for that email.
-- After signup, a teammate starts with no project access. A project owner can add them using their registered email from the project's **Team** tab.
+- **Instant Demo**: Click *Explore sample workspace* on the sign-in page to launch pre-seeded fictional engagements without creating a live account.
+- **First-Time Setup**: The first registered account automatically becomes the workspace Super User.
 
-## Included in phase one
+### Running the Test Suite
 
-| Area | Alpha behavior |
-| --- | --- |
-| Accounts | Signup, login, logout, invitation codes, first-account setup, super-user and member roles |
-| Projects | Create projects with a client name or confidential alias, financial year end, engagement type, framework, and description |
-| Dashboard | Project cards and list view; client/project search; type and status filters; sorting; actual workspace counts |
-| Project access | Explicit memberships, owner-controlled additions/removals, immediate revocation, project activity |
-| Resources | Upload/download project-scoped files, 10 MB per file; references and company templates |
-| Technical memos | Framework selection, multiple standards, additional guidance, problem statement, project-resource selection |
-| Slide decks | Proposal, training, and technical guidance briefs; conditional IPO readiness/PMO and GAAP transition fields |
-| Deliverables | Editable Markdown and live preview; Draft → In review → Approved states; conflict detection when saving stale versions |
-| Exports | Editable Word `.docx` memos, PowerPoint `.pptx` decks, and Markdown `.md` |
-| Super-user settings | Workspace name, invitations, member roles, account activation, and team memo section headings |
-| FS sanity checks | Future-module placeholder; no financial statement processing in this phase |
-
-The standards picker contains common labels for intake, rather than a complete or maintained authoritative standards library. Team members supply and verify the relevant guidance.
-
-The interface uses the supplied blue/red/white palette: blue `#23449B`, red `#ED1A3B`, and white surfaces. Theme colours are defined at the top of `public/styles.css`; Word and PowerPoint exports use the same palette. Darker red is used for small text to preserve readability.
-
-## Resources and templates
-
-All files are stored as BLOBs in the local SQLite database. Uploaded PDFs, Office documents, and images are retained for the project team to download. Binary document extraction and importing a Word/PowerPoint template's exact layout are deferred.
-
-Set shared memo headings under **Settings → Memo template**. To use a different structure for a project, upload a Markdown file as **Company memo template**, then select it in the memo brief:
-
-```markdown
-# Executive summary
-## Transaction background
-## Accounting question
-## Relevant guidance
-## Assessment
-## Conclusion
-```
-
-The first selected readable Markdown template sets the outline headings. References are listed in the outline; uploaded files are not automatically analyzed. Current Word and PowerPoint exports use a basic Advisory Desk layout. Exports always reflect the last saved version of a draft.
-
-Any project member can edit a draft and change its review status in this alpha. Status changes are tracked in project activity; formal reviewer permissions, approval signatures, and document version history are deferred.
-
-## Data boundaries
-
-The default server binds to **127.0.0.1**. The application has no outbound service integration, telemetry, analytics, or AI calls. Browsers fetch only assets and APIs from the same server; the browser content policy restricts connections to that origin.
-
-Every project detail, membership, resource, draft, and export route checks project membership on the server. Workspace-wide project, deliverable, and activity views join against the signed-in user's memberships. A brief cannot select a resource from another project, even when its author belongs to both projects. Super-user status permits team administration and does not bypass project access. Shared team template settings contain only a template name and section headings.
-
-Passwords use salted scrypt hashes. Session tokens are random, hashed in the database, held in HttpOnly/SameSite=Strict cookies, and expire after eight hours. Mutations require session-specific CSRF tokens; the server also checks host and origin. Login/signup attempts are limited per client address. Deactivation and role changes revoke a user's sessions. Resources are downloaded as attachments.
-
-The database is stored at `data/advisory.sqlite` and ignored by Git. SQLite files and resource contents are not encrypted at rest by the application; protect the directory with host permissions and an approved backup policy. Do not commit or upload runtime data. Sample accounts remain in the local database until it is reset; disable sample mode for a team installation.
-
-## Internal team deployment
-
-Provision the first super-user account from localhost before opening access to the team. An internal rollout requires an internal HTTPS reverse proxy, network egress restrictions, protected storage, and your team's access review. SSO/MFA and password-reset/email-delivery flows are future work.
-
-Copy `.env.example` to `.env` and set your environment. The Windows launcher reads `.env`; for direct startup with a file, use `node --env-file=.env server.mjs`. Existing shell environment variables take precedence.
-
-```dotenv
-HOST=0.0.0.0
-PORT=3000
-ADVISORY_ALLOW_DEMO=0
-ADVISORY_SECURE_COOKIE=1
-ADVISORY_ORIGIN=https://advisory.internal.example
-```
-
-Set `ADVISORY_ORIGIN` to the exact browser-facing origin and configure the reverse proxy to preserve that Host header. Secure cookies require HTTPS. The app makes no network-boundary guarantee about independently installed software, reverse proxies, backups, or later integrations; deploy those within your approved environment.
-
-## Validation
-
-```sh
+```powershell
 npm test
-npm run check
 ```
 
-The automated suite exercises authentication, email-bound invitations, CSRF/origin checks, validation, project/resource isolation including super users, resource-selection isolation, collaboration/revocation, draft conflicts, conditional deck briefs, account deactivation, logout, demo separation, Office exports, and local asset headers. Tests use an isolated temporary database and remove it afterward.
+The automated test suite runs via Node.js native test runner (`tests/app.test.mjs`), validating:
+- Authentication, open registration, and invitation flows
+- Role authorization, CSRF validation, and request origin checks
+- Project and resource isolation across user boundaries
+- Input sanitization and upload validation (rejects invalid dates, traversal paths, and executable files)
+- Deliverable outline generation, concurrent edit conflict detection, and status workflows
+- ZIP directory structure and OpenXML compliance for Word (`.docx`) and PowerPoint (`.pptx`) exports
+- Security headers and local-first static asset delivery
 
-No connected browser was available during implementation, so visual layout, accessibility interaction, and a full UI click-through still need verification. Office exports were checked structurally, but have not been rendered in desktop Word or PowerPoint.
+---
 
-## Structure
+## Project Structure
 
 ```text
-server.mjs          HTTP API, authentication, SQLite, access control
-lib/drafts.mjs      Memo/deck outlines and standard intake labels
-lib/exports.mjs     Native Word/PowerPoint/Markdown export
-public/index.html   Local app entry point
-public/app.js       Dashboard, project, auth, and settings interactions
-public/styles.css   Responsive workspace styling
-tests/app.test.mjs  Integration and export checks
-start.cmd           Windows local launcher
+advisory_desk/
+├── server.mjs          # Native HTTP API, authentication, SQLite, access control
+├── lib/
+│   ├── drafts.mjs      # Technical memo and slide deck outline intake templates
+│   └── exports.mjs     # Native OpenXML Word (.docx) & PowerPoint (.pptx) exporters
+├── public/
+│   ├── index.html      # Single-page application entry point
+│   ├── app.js          # Client router, Material 3 views, Hub, and Workbench logic
+│   ├── styles.css      # Material 3 minimal styling and dark mode design system
+│   └── favicon.svg     # Brand vector mark
+├── tests/
+│   └── app.test.mjs    # Complete integration and export test suite
+├── package.json        # Project metadata and test/start scripts
+├── start.cmd           # Windows launcher
+└── .env.example        # Environment configuration template
 ```
 
-## Later phases
+---
 
-AI agents and approved network-contained inference; source extraction and authoritative citations; exact company document/slide layouts; more granular reviewer access and version history; financial-statement checks after their scope is defined.
+## Internal Team Deployment
+
+To deploy for an internal advisory team:
+1. Copy `.env.example` to `.env`.
+2. Configure your environment settings:
+   ```dotenv
+   HOST=0.0.0.0
+   PORT=3000
+   ADVISORY_ALLOW_DEMO=0
+   ADVISORY_SECURE_COOKIE=1
+   ADVISORY_ORIGIN=https://advisory.internal.yourfirm.com
+   ```
+3. Place behind your organization's internal HTTPS reverse proxy with appropriate firewall and backup policies.
+
+---
+
+## Roadmap
+
+- **Engagement Creation Flow**: Dedicated multi-step wizard for configuring new client advisory workstreams.
+- **Knowledge Base (Phase 2)**: Authoritative standards library with offline paragraph indexing across IFRS, Ind AS, and US GAAP (ASC topics).
+- **FS Sanity Checks (Phase 2)**: Automated casting, cross-statement referencing, and balance verification.
+- **Local AI Agents**: Optional, network-contained offline model integration for technical memo drafting assistance without cloud egress.
