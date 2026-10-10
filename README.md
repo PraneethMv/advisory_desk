@@ -54,6 +54,9 @@ Advisory Desk follows a structured, role-aware workflow:
 
 ### 4. In-Engagement Workstation (`#project/:id`)
 All core advisory tools and deliverables sit exclusively inside each engagement:
+- **Workstream Setup**: Select **New**, choose Memo Builder or Slide Decks, and enter the setup fields. **Setup Workflow** saves the workstream and returns to the engagement dashboard without generating an outline or adding a draft document.
+- **Standalone Toolkits**: Open a saved workstream to enter its dedicated toolkit page. Create the memo or deck outline there, then edit, review, and export it. Draft documents are added to Engagement Documents only when the outline is created.
+- **Workstream Actions**: Each dashboard row has a three-dot menu for opening its toolkit, moving a draft to Final Deliverables, or deleting it. Only the creator or engagement owner can delete a workstream. Deletion requires confirmation and removes its draft while retaining saved exports and reference documents.
 - **Technical Accounting Memos**: Frame accounting questions under **IFRS**, **Ind AS**, or **US GAAP**. Select applicable accounting standards (e.g. IFRS 15, ASC 606, ASC 842), cite project evidence files, and generate editable Markdown outlines.
 - **Executive Slide Decks**: Draft presentation outlines for **Proposals** (with conditional IPO Readiness/PMO and GAAP transition fields), **Training sessions**, or **Technical discussions**.
 - **FS Sanity Checks**: Coming soon preview for automated casting and cross-referencing.

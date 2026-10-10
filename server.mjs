@@ -88,7 +88,6 @@ export async function createApp(options = {}) {
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires);
     CREATE INDEX IF NOT EXISTS resources_project ON resources(project_id);
-    CREATE INDEX IF NOT EXISTS resources_workstream ON resources(workstream_id);
     CREATE INDEX IF NOT EXISTS deliverables_project ON deliverables(project_id);
     CREATE INDEX IF NOT EXISTS activity_project ON activity(project_id);
   `);
@@ -142,6 +141,7 @@ export async function createApp(options = {}) {
   if (!resourceColumns.has('workstream_id')) {
     db.exec('ALTER TABLE resources ADD COLUMN workstream_id TEXT DEFAULT NULL');
   }
+  db.exec('CREATE INDEX IF NOT EXISTS resources_workstream ON resources(workstream_id)');
 
   db.prepare('INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)').run('workspace', JSON.stringify(DEFAULT_SETTINGS));
   const getSettings = () => JSON.parse(db.prepare('SELECT value FROM settings WHERE key=?').get('workspace').value);
@@ -520,7 +520,8 @@ export async function createApp(options = {}) {
           requireValue(resource.created_by === user.id || project.owner_id === user.id, 'Only the uploader or project owner may remove a resource.', 403);
           transaction(() => { db.prepare('DELETE FROM resources WHERE id=? AND project_id=?').run(resource.id, project.id); activity(project.id, user.id, `Removed resource: ${resource.name}`); }); respond(res, 200, { ok: true }); return;
         }
-        if (suffix === 'deliverables' && method === 'POST') {
+        if (['workstreams', 'deliverables'].includes(suffix) && method === 'POST') {
+          const setupOnly = suffix === 'workstreams';
           const input = await payload(req); requireValue(['memo', 'deck'].includes(input.kind), 'Choose a valid deliverable type.');
           const title = textField(input.title, 'Title', 160); const raw = input.params; requireValue(raw && typeof raw === 'object' && !Array.isArray(raw), 'Provide a brief.');
           const params = { problem: textField(raw.problem, 'Problem statement or brief', 8000) };
@@ -547,28 +548,60 @@ export async function createApp(options = {}) {
           const resourceIds = [...new Set(input.resourceIds)];
           const resources = resourceIds.map(id => { const r = db.prepare('SELECT id,name,kind,text FROM resources WHERE id=? AND project_id=?').get(id, project.id); requireValue(r, 'A selected resource is outside this project or unavailable.', 403); return r; });
           params.resourceIds = resourceIds;
-          const draft = buildDraft({ kind: input.kind, title, params, project, resources, settings: getSettings() }); const id = randomUUID();
-          const docId = randomUUID();
+          const body = setupOnly ? '' : buildDraft({ kind: input.kind, title, params, project, resources, settings: getSettings() }).body;
+          const id = randomUUID();
+          const docId = setupOnly ? null : randomUUID();
           const docName = `${title}.md`;
-          const draftContent = Buffer.from(draft.body, 'utf8');
+          const draftContent = Buffer.from(body, 'utf8');
           const createdTime = now();
           transaction(() => {
             db.prepare('INSERT INTO deliverables (id, project_id, kind, title, params, body, status, created_by, created, updated, is_final) VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(
-              id, project.id, input.kind, title, JSON.stringify(params), draft.body, 'Draft', user.id, createdTime, createdTime, 0
+              id, project.id, input.kind, title, JSON.stringify(params), body, setupOnly ? 'Setup' : 'Draft', user.id, createdTime, createdTime, 0
             );
-            db.prepare('INSERT INTO resources (id, project_id, name, kind, size, content, text, created_by, created, workstream_id) VALUES (?,?,?,?,?,?,?,?,?,?)').run(
-              docId, project.id, docName, 'draft', draftContent.length, draftContent, draft.body, user.id, createdTime, id
-            );
+            if (!setupOnly) {
+              db.prepare('INSERT INTO resources (id, project_id, name, kind, size, content, text, created_by, created, workstream_id) VALUES (?,?,?,?,?,?,?,?,?,?)').run(
+                docId, project.id, docName, 'draft', draftContent.length, draftContent, body, user.id, createdTime, id
+              );
+            }
             db.prepare('UPDATE projects SET updated=? WHERE id=?').run(createdTime, project.id);
-            activity(project.id, user.id, `Created ${input.kind === 'memo' ? 'memo' : 'deck'} outline: ${title}`);
+            activity(project.id, user.id, setupOnly ? `Set up ${input.kind === 'memo' ? 'Memo Builder' : 'Slide Decks'} workstream: ${title}` : `Created ${input.kind === 'memo' ? 'memo' : 'deck'} outline: ${title}`);
           });
           respond(res, 201, { id, resourceId: docId });
+          return;
+        }
+        const generateMatch = /^deliverables\/([\w-]+)\/generate$/.exec(suffix);
+        if (generateMatch && method === 'POST') {
+          const input = await payload(req);
+          const delivery = db.prepare('SELECT * FROM deliverables WHERE id=? AND project_id=?').get(generateMatch[1], project.id);
+          requireValue(delivery, 'Workstream not found.', 404);
+          requireValue(!delivery.body.trim(), 'This workstream already has an outline. Open the toolkit to edit it.', 409);
+          requireValue(input.updated === delivery.updated, 'This workstream was updated by someone else. Reopen it before continuing.', 409);
+          const params = JSON.parse(delivery.params);
+          const resources = (params.resourceIds || []).map(id => {
+            const resource = db.prepare('SELECT id,name,kind,text FROM resources WHERE id=? AND project_id=?').get(id, project.id);
+            requireValue(resource, 'A selected resource is outside this project or unavailable. Restore it before creating the outline.', 409);
+            return resource;
+          });
+          const draft = buildDraft({ kind: delivery.kind, title: delivery.title, params, project, resources, settings: getSettings() });
+          const bytes = Buffer.from(draft.body, 'utf8');
+          const updated = new Date(Math.max(Date.now(), Date.parse(delivery.updated) + 1)).toISOString();
+          const resourceId = randomUUID();
+          transaction(() => {
+            db.prepare("UPDATE deliverables SET body=?,status='Draft',updated=? WHERE id=? AND project_id=?").run(draft.body, updated, delivery.id, project.id);
+            db.prepare('INSERT INTO resources (id, project_id, name, kind, size, content, text, created_by, created, workstream_id) VALUES (?,?,?,?,?,?,?,?,?,?)').run(
+              resourceId, project.id, `${delivery.title}.md`, 'draft', bytes.length, bytes, draft.body, delivery.created_by, delivery.created, delivery.id
+            );
+            db.prepare('UPDATE projects SET updated=? WHERE id=?').run(updated, project.id);
+            activity(project.id, user.id, `Created ${delivery.kind === 'memo' ? 'memo' : 'deck'} outline: ${delivery.title}`);
+          });
+          respond(res, 200, { ok: true, resourceId });
           return;
         }
         const finalizeMatch = /^deliverables\/([\w-]+)\/finalize$/.exec(suffix);
         if (finalizeMatch && method === 'POST') {
           const delivery = db.prepare('SELECT * FROM deliverables WHERE id=? AND project_id=?').get(finalizeMatch[1], project.id);
           requireValue(delivery, 'Deliverable not found.', 404);
+          requireValue(delivery.body.trim(), 'Open the workstream toolkit and create an outline before finalizing.', 409);
           const updated = new Date(Math.max(Date.now(), Date.parse(delivery.updated) + 1)).toISOString();
           transaction(() => {
             db.prepare("UPDATE deliverables SET is_final=1, status='Final', updated=? WHERE id=? AND project_id=?").run(updated, delivery.id, project.id);
@@ -582,6 +615,7 @@ export async function createApp(options = {}) {
         if (saveExportMatch && method === 'POST') {
           const delivery = db.prepare('SELECT * FROM deliverables WHERE id=? AND project_id=?').get(saveExportMatch[1], project.id);
           requireValue(delivery, 'Deliverable not found.', 404);
+          requireValue(delivery.body.trim(), 'Open the workstream toolkit and create an outline before exporting.', 409);
           const input = await payload(req).catch(() => ({}));
           const format = input.format === 'docx' || input.format === 'pptx' ? input.format : (delivery.kind === 'memo' ? 'docx' : 'pptx');
           const exported = exportDocument(delivery, format);
@@ -601,12 +635,25 @@ export async function createApp(options = {}) {
         if (deliveryMatch) {
           const delivery = db.prepare('SELECT * FROM deliverables WHERE id=? AND project_id=?').get(deliveryMatch[1], project.id); requireValue(delivery, 'Deliverable not found.', 404);
           if (deliveryMatch[2] && method === 'GET') {
+            requireValue(delivery.body.trim(), 'Open the workstream toolkit and create an outline before exporting.', 409);
             const format = deliveryMatch[2]; requireValue(format === 'md' || (delivery.kind === 'memo' ? format === 'docx' : format === 'pptx'), 'This format is unavailable for this deliverable.');
             const exported = exportDocument(delivery, format);
             const filename = `${delivery.title.replace(/[^\p{L}\p{N} _-]/gu, '').slice(0, 100) || 'deliverable'}.${format}`;
             res.writeHead(200, { ...headers, 'Content-Type': exported.mime, 'Content-Disposition': `attachment; filename="deliverable.${format}"; filename*=UTF-8''${encodeURIComponent(filename).replace(/'/g, '%27')}` }); res.end(exported.bytes); return;
           }
           if (method === 'GET' && !deliveryMatch[2]) { respond(res, 200, { deliverable: { ...delivery, params: JSON.parse(delivery.params) } }); return; }
+          if (method === 'DELETE' && !deliveryMatch[2]) {
+            requireValue(delivery.created_by === user.id || project.owner_id === user.id, 'Only the workstream creator or project owner may delete a workstream.', 403);
+            transaction(() => {
+              db.prepare("DELETE FROM resources WHERE project_id=? AND workstream_id=? AND kind='draft'").run(project.id, delivery.id);
+              db.prepare('UPDATE resources SET workstream_id=NULL WHERE project_id=? AND workstream_id=?').run(project.id, delivery.id);
+              db.prepare('DELETE FROM deliverables WHERE id=? AND project_id=?').run(delivery.id, project.id);
+              db.prepare('UPDATE projects SET updated=? WHERE id=?').run(now(), project.id);
+              activity(project.id, user.id, `Deleted workstream: ${delivery.title}`);
+            });
+            respond(res, 200, { ok: true });
+            return;
+          }
           if (method === 'PATCH' && !deliveryMatch[2]) {
             const input = await payload(req); const title = textField(input.title, 'Title', 160); const body = textField(input.body, 'Content', 200000);
             requireValue(['Draft', 'In review', 'Approved', 'Final'].includes(input.status), 'Choose a valid review status.');
@@ -618,7 +665,7 @@ export async function createApp(options = {}) {
                 title, body, input.status, updated, isFinalVal, delivery.id, project.id
               );
               // Sync corresponding draft document in resources
-              const draftDoc = db.prepare('SELECT id FROM resources WHERE workstream_id=? AND project_id=?').get(delivery.id, project.id);
+              const draftDoc = db.prepare("SELECT id FROM resources WHERE workstream_id=? AND project_id=? AND kind='draft'").get(delivery.id, project.id);
               const draftBytes = Buffer.from(body, 'utf8');
               if (draftDoc) {
                 db.prepare('UPDATE resources SET name=?, size=?, content=?, text=? WHERE id=?').run(

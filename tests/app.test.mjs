@@ -2,6 +2,7 @@ import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, rm, readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { createApp } from '../server.mjs';
 import { buildDraft } from '../lib/drafts.mjs';
 import { exportDocument } from '../lib/exports.mjs';
@@ -627,6 +628,176 @@ test('workstream draft file only gets added to engagement documents and inherits
   // Verify CSS styles for action buttons and chips
   assert.match(stylesCss, /\.move-final-action-btn\s*\{/);
   assert.match(stylesCss, /\.final-chip\s*\{/);
+});
+
+test('workstream setup saves intake separately from toolkit generation', async t => {
+  const owner = client();
+  await owner.request('/auth/login', 'POST', { email: 'owner@example.test', password: 'correct horse battery staple' });
+  const outsider = client();
+  await outsider.request('/auth/demo', 'POST', {});
+
+  for (const kind of ['memo', 'deck']) {
+    await t.test(`${kind} setup creates no document; its toolkit generates once and preserves edits`, async () => {
+      const projectId = (await owner.request('/projects', 'POST', projectInput(`${kind} workflow setup`))).body.project.id;
+      const evidenceId = (await owner.request(`/projects/${projectId}/resources`, 'POST', resourceInput())).body.id;
+      const params = kind === 'memo'
+        ? { gaap: 'US GAAP', standards: ['ASC 606 · Revenue'], problem: 'Assess the transaction.' }
+        : { deckType: 'Proposal', area: 'IPO', ipoTrack: 'Readiness', audience: 'Board', problem: 'Plan IPO readiness.' };
+      const created = await owner.request(`/projects/${projectId}/workstreams`, 'POST', { kind, title: `${kind} saved setup`, params, resourceIds: [evidenceId] });
+      assert.equal(created.status, 201);
+      assert.equal(created.body.resourceId, null);
+      const id = created.body.id;
+      const workstreamPath = `/projects/${projectId}/deliverables/${id}`;
+      const setup = (await owner.request(workstreamPath)).body.deliverable;
+      assert.equal(setup.status, 'Setup');
+      assert.equal(setup.body, '');
+      assert.equal(setup.is_final, 0);
+      assert.equal(setup.params.problem, params.problem);
+      assert.deepEqual(setup.params.resourceIds, [evidenceId]);
+      const projectBefore = (await owner.request(`/projects/${projectId}`)).body;
+      assert.equal(projectBefore.deliverables.length, 1);
+      assert.equal(projectBefore.resources.length, 1, 'Setup must not generate a draft document');
+      assert.equal((await owner.request(workstreamPath + '/export/md')).status, 409);
+      assert.equal((await owner.request(workstreamPath + '/finalize', 'POST', {})).status, 409);
+      assert.equal((await owner.request(workstreamPath + '/save-to-documents', 'POST', {})).status, 409);
+      assert.equal((await outsider.request(workstreamPath + '/generate', 'POST', { updated: setup.updated })).status, 404);
+      assert.equal((await owner.request(workstreamPath + '/generate', 'POST', { updated: 'stale' })).status, 409);
+
+      const generated = await owner.request(workstreamPath + '/generate', 'POST', { updated: setup.updated });
+      assert.equal(generated.status, 200);
+      const draft = (await owner.request(workstreamPath)).body.deliverable;
+      assert.equal(draft.status, 'Draft');
+      assert.notEqual(draft.updated, setup.updated);
+      assert.match(draft.body, /WORKING OUTLINE|IPO/);
+      assert.match(draft.body, /Secret brief.md/);
+      const projectAfter = (await owner.request(`/projects/${projectId}`)).body;
+      const document = projectAfter.resources.find(r => r.workstream_id === id);
+      assert.equal(projectAfter.deliverables.length, 1, 'Generation must reuse the configured workstream');
+      assert.equal(projectAfter.resources.length, 2);
+      assert.equal(document.kind, 'draft');
+      assert.equal(document.created_by, setup.created_by);
+      assert.equal(document.created, setup.created);
+
+      const editedBody = draft.body + '\n\nTeam analysis to retain.';
+      assert.equal((await owner.request(workstreamPath, 'PATCH', { title: draft.title, body: editedBody, status: 'In review', updated: draft.updated })).status, 200);
+      const edited = (await owner.request(workstreamPath)).body.deliverable;
+      assert.equal((await owner.request(workstreamPath + '/generate', 'POST', { updated: edited.updated })).status, 409);
+      assert.equal((await owner.request(workstreamPath)).body.deliverable.body, editedBody);
+      assert.equal((await owner.request(workstreamPath + `/export/${kind === 'memo' ? 'docx' : 'pptx'}`)).status, 200);
+      assert.equal((await owner.request(workstreamPath + '/finalize', 'POST', {})).status, 200);
+    });
+  }
+
+  await t.test('setup and generation keep selected evidence inside its engagement', async () => {
+    const projectA = (await owner.request('/projects', 'POST', projectInput('Setup evidence A'))).body.project.id;
+    const projectB = (await owner.request('/projects', 'POST', projectInput('Setup evidence B'))).body.project.id;
+    const evidenceId = (await owner.request(`/projects/${projectA}/resources`, 'POST', resourceInput())).body.id;
+    assert.equal((await owner.request(`/projects/${projectB}/workstreams`, 'POST', memoInput([evidenceId]))).status, 403);
+    const id = (await owner.request(`/projects/${projectA}/workstreams`, 'POST', memoInput([evidenceId]))).body.id;
+    const path = `/projects/${projectA}/deliverables/${id}`;
+    const setup = (await owner.request(path)).body.deliverable;
+    await owner.request(`/projects/${projectA}/resources/${evidenceId}`, 'DELETE');
+    assert.equal((await owner.request(path + '/generate', 'POST', { updated: setup.updated })).status, 409);
+    assert.equal((await owner.request(path)).body.deliverable.body, '');
+    assert.equal((await owner.request(`/projects/${projectA}`)).body.resources.length, 0);
+  });
+});
+
+test('workstream deletion enforces ownership and preserves evidence and saved exports', async t => {
+  const owner = client();
+  await owner.request('/auth/login', 'POST', { email: 'owner@example.test', password: 'correct horse battery staple' });
+  const creator = client();
+  const teammate = client();
+  for (const [session, email, name] of [[creator, 'workflow-creator@example.test', 'Workstream Creator'], [teammate, 'workflow-teammate@example.test', 'Workstream Teammate']]) {
+    assert.equal((await session.request('/auth/signup', 'POST', { email, name, password: 'workflow test password only' })).status, 200);
+    assert.equal((await session.request('/me/preferences', 'PATCH', { name, employeeId: email, designation: 'Manager', acceptUsagePolicy: true })).status, 200);
+  }
+  const projectId = (await owner.request('/projects', 'POST', projectInput('Workstream deletion'))).body.project.id;
+  const otherProjectId = (await owner.request('/projects', 'POST', projectInput('Other deletion project'))).body.project.id;
+  for (const email of ['workflow-creator@example.test', 'workflow-teammate@example.test']) {
+    assert.equal((await owner.request(`/projects/${projectId}/members`, 'POST', { email })).status, 201);
+  }
+  const evidenceId = (await owner.request(`/projects/${projectId}/resources`, 'POST', resourceInput())).body.id;
+  const created = (await creator.request(`/projects/${projectId}/deliverables`, 'POST', memoInput([evidenceId]))).body;
+  const path = `/projects/${projectId}/deliverables/${created.id}`;
+  const exportId = (await creator.request(path + '/save-to-documents', 'POST', { format: 'docx' })).body.id;
+  const exportBefore = (await owner.request(`/projects/${projectId}/resources/${exportId}`)).body;
+  const unrelatedId = (await owner.request(`/projects/${projectId}/workstreams`, 'POST', memoInput([]))).body.id;
+
+  await t.test('only the creator or engagement owner can delete, with session and CSRF protection', async () => {
+    assert.equal((await client().request(path, 'DELETE')).status, 401);
+    const outsider = client();
+    await outsider.request('/auth/demo', 'POST', {});
+    assert.equal((await outsider.request(path, 'DELETE')).status, 404);
+    assert.equal((await teammate.request(path, 'DELETE')).status, 403);
+    assert.equal((await owner.request(`/projects/${otherProjectId}/deliverables/${created.id}`, 'DELETE')).status, 404);
+    assert.equal((await owner.request(path, 'DELETE', undefined, { 'X-CSRF-Token': '' })).status, 403);
+    assert.equal((await owner.request(path + '/export/md', 'DELETE')).status, 404);
+    assert.equal((await owner.request(path)).status, 200);
+  });
+
+  await t.test('creator deletion removes its draft, detaches exports, and records the action', async () => {
+    assert.equal((await creator.request(path, 'DELETE')).status, 200);
+    assert.equal((await owner.request(path)).status, 404);
+    assert.equal((await owner.request(path + '/export/docx')).status, 404);
+    assert.equal((await owner.request(`/projects/${projectId}/resources/${created.resourceId}`)).status, 404);
+    assert.equal((await owner.request(path, 'DELETE')).status, 404);
+    const project = (await owner.request(`/projects/${projectId}`)).body;
+    assert.deepEqual(project.deliverables.map(d => d.id), [unrelatedId]);
+    assert.equal(project.resources.length, 2);
+    assert.ok(project.resources.some(r => r.id === evidenceId));
+    assert.equal(project.resources.find(r => r.id === exportId).workstream_id, null);
+    assert.deepEqual((await owner.request(`/projects/${projectId}/resources/${exportId}`)).body, exportBefore);
+    assert.ok(project.activity.some(a => a.action === 'Deleted workstream: Revenue <review> & memo'));
+  });
+
+  await t.test('the owner can delete another creator’s final workstream, and setup deletion leaves documents intact', async () => {
+    const final = (await creator.request(`/projects/${projectId}/deliverables`, 'POST', memoInput([]))).body;
+    const finalPath = `/projects/${projectId}/deliverables/${final.id}`;
+    assert.equal((await creator.request(finalPath + '/finalize', 'POST', {})).status, 200);
+    assert.equal((await owner.request(finalPath, 'DELETE')).status, 200);
+    assert.equal((await owner.request(`/projects/${projectId}/resources/${final.resourceId}`)).status, 404);
+    const setup = (await creator.request(`/projects/${projectId}/workstreams`, 'POST', memoInput([]))).body;
+    assert.equal((await creator.request(`/projects/${projectId}/deliverables/${setup.id}`, 'DELETE')).status, 200);
+    const project = (await owner.request(`/projects/${projectId}`)).body;
+    assert.deepEqual(project.deliverables.map(d => d.id), [unrelatedId]);
+    assert.equal(project.resources.length, 2);
+  });
+});
+
+test('older databases upgrade before workstream indexes are created and preserve existing documents', async () => {
+  const legacyDir = await mkdtemp(resolve('test-results', 'legacy-'));
+  let legacyApp;
+  try {
+    const oldDb = new DatabaseSync(resolve(legacyDir, 'advisory.sqlite'));
+    try {
+      oldDb.exec(`
+        CREATE TABLE resources (id TEXT PRIMARY KEY, project_id TEXT, name TEXT NOT NULL, kind TEXT NOT NULL, size INTEGER NOT NULL, content BLOB NOT NULL, text TEXT NOT NULL DEFAULT '', created_by TEXT, created TEXT NOT NULL);
+        CREATE TABLE deliverables (id TEXT PRIMARY KEY, project_id TEXT, kind TEXT NOT NULL, title TEXT NOT NULL, params TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Draft', created_by TEXT, created TEXT NOT NULL, updated TEXT NOT NULL);
+      `);
+      const bytes = Buffer.from('Existing engagement evidence');
+      const timestamp = '2026-10-01T00:00:00.000Z';
+      oldDb.prepare('INSERT INTO resources VALUES (?,?,?,?,?,?,?,?,?)').run('legacy-document', null, 'Existing evidence.md', 'reference', bytes.length, bytes, bytes.toString(), null, timestamp);
+      oldDb.prepare('INSERT INTO deliverables VALUES (?,?,?,?,?,?,?,?,?,?)').run('legacy-memo', null, 'memo', 'Existing memo', '{}', '# Existing memo', 'Draft', null, timestamp, timestamp);
+    } finally {
+      oldDb.close();
+    }
+    legacyApp = await createApp({ dataDir: legacyDir });
+    const document = legacyApp.db.prepare('SELECT * FROM resources WHERE id=?').get('legacy-document');
+    assert.equal(Buffer.from(document.content).toString(), 'Existing engagement evidence');
+    assert.equal(document.name, 'Existing evidence.md');
+    assert.equal(document.workstream_id, null);
+    const memo = legacyApp.db.prepare('SELECT * FROM deliverables WHERE id=?').get('legacy-memo');
+    assert.equal(memo.body, '# Existing memo');
+    assert.equal(memo.is_final, 0);
+    assert.ok(legacyApp.db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='resources_workstream'").get());
+    await legacyApp.close();
+    legacyApp = await createApp({ dataDir: legacyDir });
+    assert.equal(legacyApp.db.prepare('SELECT COUNT(*) AS count FROM resources').get().count, 1, 'Migration should be safe to run again');
+  } finally {
+    if (legacyApp) await legacyApp.close();
+    await rm(legacyDir, { recursive: true, force: true });
+  }
 });
 
 

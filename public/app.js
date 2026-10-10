@@ -61,6 +61,11 @@ function normalizeFramework(f) {
   return f;
 }
 
+function toolkitFramework(f) {
+  const framework = ({ USGAAP: 'US GAAP', Others: 'Other', IGAAP: 'Other' })[f] || f;
+  return frameworks.includes(framework) ? framework : 'IFRS';
+}
+
 const date = value => new Intl.DateTimeFormat('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }).format(new Date(value));
 const formatDateTime = value => {
   if (!value) return '—';
@@ -126,6 +131,53 @@ const paths = {
 
 const icon = (name, cls = '') => `<svg class="icon ${cls}" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.file}</svg>`;
 const button = (text, action, cls = 'btn primary', more = '') => `<button type="button" class="${cls}" data-action="${action}" ${more}>${text}</button>`;
+
+const workstreamMenu = document.createElement('div');
+workstreamMenu.id = 'workstream-actions-menu';
+workstreamMenu.className = 'workstream-actions-menu';
+workstreamMenu.setAttribute('role', 'menu');
+workstreamMenu.hidden = true;
+document.body.append(workstreamMenu);
+let workstreamMenuTrigger = null;
+
+function closeWorkstreamMenu(restoreFocus = false) {
+  const trigger = workstreamMenuTrigger;
+  workstreamMenu.hidden = true;
+  trigger?.setAttribute('aria-expanded', 'false');
+  workstreamMenuTrigger = null;
+  if (restoreFocus && trigger?.isConnected) trigger.focus();
+}
+
+function toggleWorkstreamMenu(trigger) {
+  const wasOpen = workstreamMenuTrigger === trigger && !workstreamMenu.hidden;
+  closeWorkstreamMenu();
+  if (wasOpen) return;
+  const project = state.project?.project;
+  const delivery = state.project?.deliverables?.find(d => d.id === trigger.dataset.id);
+  if (!project || !delivery) return;
+  const attrs = `data-project="${e(project.id)}" data-id="${e(delivery.id)}"`;
+  workstreamMenu.innerHTML = `
+    <button type="button" role="menuitem" class="workstream-menu-item" data-action="edit-delivery" ${attrs}>${icon('arrow')} Open toolkit</button>
+    ${!delivery.is_final && delivery.status !== 'Setup' ? `
+      <button type="button" role="menuitem" class="workstream-menu-item" data-action="promote-to-final" ${attrs}>${icon('check')} Move to Final</button>
+    ` : ''}
+    ${delivery.created_by === state.user.id || project.owner_id === state.user.id ? `
+      <button type="button" role="menuitem" class="workstream-menu-item destructive" data-action="delete-workstream" ${attrs} data-name="${e(delivery.title)}">${icon('trash')} Delete</button>
+    ` : ''}
+  `;
+  workstreamMenu.setAttribute('aria-label', `Actions for ${delivery.title}`);
+  workstreamMenuTrigger = trigger;
+  workstreamMenu.hidden = false;
+  trigger.setAttribute('aria-expanded', 'true');
+  const anchor = trigger.getBoundingClientRect();
+  const menu = workstreamMenu.getBoundingClientRect();
+  const left = Math.max(8, Math.min(anchor.right - menu.width, window.innerWidth - menu.width - 8));
+  const below = anchor.bottom + 6;
+  const top = below + menu.height <= window.innerHeight - 8 ? below : Math.max(8, anchor.top - menu.height - 6);
+  workstreamMenu.style.left = `${left}px`;
+  workstreamMenu.style.top = `${top}px`;
+  workstreamMenu.querySelector('[role="menuitem"]')?.focus();
+}
 const options = (items, selected) => items.map(v => `<option value="${e(v)}" ${v === selected ? 'selected' : ''}>${e(v)}</option>`).join('');
 const badge = status => `<span class="badge ${status === 'Active' || status === 'Approved' || status === 'Final' ? 'status-active' : status === 'In review' || status === 'On hold' ? 'status-review' : status === 'Completed' ? 'status-neutral' : 'status-draft'}"><span class="badge-dot"></span>${e(status)}</span>`;
 const typeIcon = type => type === 'Technical memo' ? 'file' : type === 'Training' ? 'book' : type === 'IPO advisory' ? 'chart' : type === 'GAAP transition' ? 'arrow' : type === 'Staff augmentation' ? 'users' : 'folder';
@@ -780,7 +832,7 @@ function renderHub() {
    ========================================================================== */
 
 function shell(content, title = 'Projects', trail = '') {
-  const isProject = Boolean(state.page === 'project' && state.project && state.project.project);
+  const isProject = Boolean(['project', 'workstream'].includes(state.page) && state.project && state.project.project);
   const projectData = isProject ? state.project : null;
   const p = projectData?.project;
 
@@ -790,9 +842,9 @@ function shell(content, title = 'Projects', trail = '') {
   };
 
   const projectTabNav = (tab, text, symbol, count) => {
-    const isTabActive = (tab === 'setup')
+    const isTabActive = state.page !== 'workstream' && ((tab === 'setup')
       ? (state.projectTab === 'setup' || state.projectTab === 'team')
-      : (state.projectTab === tab);
+      : (state.projectTab === tab));
     return `
       <button type="button" class="nav-link ${isTabActive ? 'active' : ''}" data-action="project-tab" data-tab="${tab}">
         ${icon(symbol)}
@@ -892,7 +944,7 @@ function shell(content, title = 'Projects', trail = '') {
   const breadcrumbTarget = isProject ? 'project-setup' : state.page;
 
   app.innerHTML = `
-    <div class="app-shell">
+    <div class="app-shell ${isProject ? 'engagement-shell' : ''} ${state.page === 'workstream' ? 'workstream-shell' : ''}">
       <aside class="sidebar">
         <a class="brand" href="#hub">
           <span class="brand-mark">a<span>↗</span></span>
@@ -1757,15 +1809,8 @@ function renderProject() {
                   <span class="font-mono text-muted">${formatDateTime(d.created)}</span>
                 </div>
                 <div class="workstream-col-action">
-                  ${!isFinal ? `
-                    <button type="button" class="btn outline small-btn move-final-action-btn" data-action="promote-to-final" data-project="${p.id}" data-id="${d.id}" title="Move to Final Deliverables">
-                      ${icon('check')} Move to Final
-                    </button>
-                  ` : `
-                    <span class="final-chip">${icon('check')} Final</span>
-                  `}
-                  <button type="button" class="quiet-ghost-action" data-action="edit-delivery" data-project="${p.id}" data-id="${d.id}" aria-label="Open ${e(d.title)}">
-                    ${icon('arrow')}
+                  <button type="button" class="quiet-ghost-action workstream-menu-trigger" data-action="toggle-workstream-menu" data-id="${d.id}" aria-label="Actions for ${e(d.title)}" aria-haspopup="menu" aria-expanded="false" aria-controls="workstream-actions-menu" title="Workstream actions">
+                    ${icon('more')}
                   </button>
                 </div>
               </div>
@@ -1778,10 +1823,10 @@ function renderProject() {
       <div class="quiet-table-wrap">
         <div class="quiet-table-header workstream-cols">
           <span>WORKSTREAM</span>
-          <span>TYPE</span>
+          <span class="workstream-header-type">TYPE</span>
           <span>STATUS</span>
-          <span>CREATED BY</span>
-          <span>CREATED TIME</span>
+          <span class="workstream-header-author">CREATED BY</span>
+          <span class="workstream-header-time">CREATED TIME</span>
           <span></span>
         </div>
         ${workstreamsTableBody}
@@ -1799,7 +1844,7 @@ function renderProject() {
         </div>
       `
       : `
-        <div class="resource-list">
+        <div class="resource-list document-table-list">
           ${data.resources.map(r => {
             const creator = data.members?.find(m => m.id === r.created_by)?.name || (r.created_by === state.user.id ? state.user.name : 'Team member');
             return `
@@ -1834,9 +1879,9 @@ function renderProject() {
       <div class="quiet-table-wrap">
         <div class="quiet-table-header document-cols">
           <span>DOCUMENT</span>
-          <span>SIZE</span>
-          <span>ADDED BY</span>
-          <span>CREATED TIME</span>
+          <span class="document-header-size">SIZE</span>
+          <span class="document-header-author">ADDED BY</span>
+          <span class="document-header-time">CREATED TIME</span>
           <span></span>
         </div>
         ${documentsTableBody}
@@ -2270,7 +2315,7 @@ function standardsCheckboxes(gaap) {
 function openWorkstreamModal() {
   showModal(
     'Engagement Toolkits',
-    'Select a deliverable toolkit to develop for this engagement.',
+    'Select a toolkit, then set up its engagement workstream.',
     `
       <div class="toolkit-modal-grid">
         <article class="toolkit-modal-card" data-action="new-memo" role="button" tabindex="0">
@@ -2280,7 +2325,7 @@ function openWorkstreamModal() {
           <h3>Memo Builder</h3>
           <p>Frame the question, select applicable accounting standards, cite project evidence, and build a working outline.</p>
           <div class="toolkit-card-action">
-            <span class="text-link">Start a memo ${icon('arrow')}</span>
+            <span class="text-link">Set up workstream ${icon('arrow')}</span>
           </div>
         </article>
 
@@ -2291,7 +2336,7 @@ function openWorkstreamModal() {
           <h3>Slide Decks</h3>
           <p>Bring structure to a proposal, training session, or technical discussion with native PowerPoint export.</p>
           <div class="toolkit-card-action">
-            <span class="text-link">Start a deck ${icon('arrow')}</span>
+            <span class="text-link">Set up workstream ${icon('arrow')}</span>
           </div>
         </article>
 
@@ -2314,9 +2359,10 @@ function openWorkstreamModal() {
 
 function newMemo() {
   const p = state.project.project;
+  const gaap = toolkitFramework(p.gaap);
   showModal(
-    'Draft Technical Accounting Memo',
-    'Capture problem statement, select accounting standards, and generate outline.',
+    'Set Up Memo Workstream',
+    'Save the workstream setup. Open it from the dashboard to use Memo Builder.',
     `
       <form id="new-memo-form">
         <div class="form-stack">
@@ -2324,11 +2370,11 @@ function newMemo() {
             <input name="title" placeholder="e.g. Accounting for Multi-Element Software Arrangement" required maxlength="160" autofocus>
           </label>
           <label>Accounting framework
-            <select name="gaap" id="memo-gaap">${options(frameworks, p.gaap)}</select>
+            <select name="gaap" id="memo-gaap">${options(frameworks, gaap)}</select>
           </label>
           <fieldset class="standards-picker">
             <legend>Relevant standards <span class="optional">Select applicable guidance</span></legend>
-            <div id="standards-options">${standardsCheckboxes(p.gaap)}</div>
+            <div id="standards-options">${standardsCheckboxes(gaap)}</div>
           </fieldset>
           <label>Additional standard or topic <span class="optional">Optional</span>
             <input name="customStandard" placeholder="e.g. ASC 606-10-25-14 or specific IFRIC agenda decision" maxlength="500">
@@ -2339,10 +2385,10 @@ function newMemo() {
           ${resourcePicker()}
           <div class="inline-note">
             ${icon('book')}
-            <span>Generates an editable Markdown outline based on team templates and selected standards.</span>
+            <span>Setup saves your brief, standards, and evidence selection. Open the workstream to create and edit the memo.</span>
           </div>
         </div>
-        ${modalActions('Create memo outline')}
+        ${modalActions('Setup Workflow')}
       </form>
     `,
     'wide-modal'
@@ -2375,7 +2421,7 @@ function proposalFields(area) {
     return `
       <div class="form-grid">
         <label>Current reporting framework<select name="currentGaap">${options(frameworks, 'Other')}</select></label>
-        <label>Target reporting framework<select name="targetGaap">${options(frameworks, state.project?.project?.gaap || 'IFRS')}</select></label>
+        <label>Target reporting framework<select name="targetGaap">${options(frameworks, toolkitFramework(state.project?.project?.gaap))}</select></label>
       </div>
       <label>Current accounting methodologies <span class="optional">Optional</span>
         <textarea name="methodologies" rows="2" placeholder="Key accounting policies, revenue recognition timing, lease models…" maxlength="4000"></textarea>
@@ -2389,8 +2435,8 @@ function newDeck() {
   const p = state.project.project;
   const area = p.type === 'GAAP transition' ? 'GAAP transition' : 'IPO';
   showModal(
-    'Draft Executive Slide Deck',
-    'Structure an executive presentation outline with native 16:9 PowerPoint export.',
+    'Set Up Slide Deck Workstream',
+    'Save the workstream setup. Open it from the dashboard to use Slide Decks.',
     `
       <form id="new-deck-form">
         <div class="form-stack">
@@ -2407,10 +2453,10 @@ function newDeck() {
           ${resourcePicker()}
           <div class="inline-note">
             ${icon('slides')}
-            <span>Generates an editable slide structure. You can edit each slide in Markdown and download as .pptx.</span>
+            <span>Setup saves your presentation brief and evidence selection. Open the workstream to build and export the deck.</span>
           </div>
         </div>
-        ${modalActions('Create deck outline')}
+        ${modalActions('Setup Workflow')}
       </form>
     `,
     'wide-modal'
@@ -2445,22 +2491,53 @@ function slidePreview(body) {
 }
 
 async function editDelivery(project, id) {
-  const data = await api(`/projects/${project}/deliverables/${id}`);
+  location.hash = `#project/${project}/workstream/${id}`;
+}
+
+async function renderWorkstream(project, id) {
+  const [projectData, data] = await Promise.all([
+    api(`/projects/${project}`),
+    api(`/projects/${project}/deliverables/${id}`)
+  ]);
+  state.project = projectData;
   state.editing = data.deliverable;
   state.editingProject = project;
   const d = state.editing;
+  const p = projectData.project;
+  const params = d.params;
+  const toolkit = d.kind === 'memo' ? 'Memo Builder' : 'Slide Decks';
+  const pending = !d.body.trim();
+  const evidence = (params.resourceIds || []).map(resourceId => projectData.resources.find(r => r.id === resourceId));
+  const details = d.kind === 'memo'
+    ? [['Accounting framework', params.gaap], ['Selected standards', params.standards.join(' · ') || 'No standards selected']]
+    : [['Deck type', params.deckType], ['Proposal area', params.area], ['IPO focus', params.ipoTrack], ['Current framework', params.currentGaap], ['Target framework', params.targetGaap], ['Audience', params.audience], ['Current methodologies', params.methodologies]];
 
-  showModal(
-    d.kind === 'memo' ? 'Technical Memo Editor' : 'Slide Deck Editor',
-    'Edit the working markdown, adjust review status, and export document.',
-    `
+  const content = pending ? `
+    <section class="panel workstream-setup-summary">
+      <div class="workstream-toolkit-intro">
+        <span class="module-icon ${d.kind === 'memo' ? 'tone-blue' : 'tone-red'}">${icon(d.kind === 'memo' ? 'file' : 'slides')}</span>
+        <div>
+          <h2>Your workstream is ready</h2>
+          <p>Use ${toolkit} to create a working outline from the saved setup, then edit and export your ${d.kind === 'memo' ? 'memo' : 'presentation'}.</p>
+        </div>
+      </div>
+      <dl class="workstream-setup-details">
+        ${details.filter(([, value]) => value).map(([label, value]) => `<div><dt>${e(label)}</dt><dd>${e(value)}</dd></div>`).join('')}
+        <div><dt>${d.kind === 'memo' ? 'Transaction brief' : 'Presentation objectives and brief'}</dt><dd class="workstream-brief">${e(params.problem)}</dd></div>
+        <div><dt>Selected project evidence</dt><dd>${evidence.length ? evidence.map(r => `<span class="workstream-evidence-item">${e(r?.name || 'Selected resource is unavailable')}</span>`).join('') : 'No resources selected'}</dd></div>
+      </dl>
+      <div class="workstream-toolkit-actions">
+        ${button(icon('plus') + (d.kind === 'memo' ? ' Create memo outline' : ' Create deck outline'), 'generate-outline', 'btn primary')}
+      </div>
+    </section>
+  ` : `
       <form id="edit-delivery-form">
         <div class="editor-meta">
           <label>Title
             <input name="title" value="${e(d.title)}" required maxlength="160">
           </label>
           <label>Review status
-            <select name="status">${options(['Draft', 'In review', 'Approved'], d.status)}</select>
+            <select name="status">${options(['Draft', 'In review', 'Approved', ...(d.is_final ? ['Final'] : [])], d.status)}</select>
           </label>
         </div>
 
@@ -2490,7 +2567,7 @@ async function editDelivery(project, id) {
         <div class="form-error" role="alert"></div>
         <div class="modal-actions">
           <span style="font-size:11.5px;color:var(--text-muted);margin-right:auto;">Drafts & exports stay in Engagement Documents until moved to Final Deliverables.</span>
-          ${button('Close', 'close-modal', 'btn secondary')}
+          <a href="#project/${project}" class="btn secondary">Back to engagement</a>
           <button type="submit" class="btn secondary">Save draft ${icon('check')}</button>
           ${!d.is_final ? `
             <button type="button" class="btn primary move-to-final-btn" data-action="promote-to-final" data-project="${project}" data-id="${id}">
@@ -2501,9 +2578,24 @@ async function editDelivery(project, id) {
           `}
         </div>
       </form>
-    `,
-    'editor-modal'
-  );
+    `;
+
+  shell(`
+    <div class="workstream-toolkit-page">
+      <section class="page-heading">
+        <div>
+          <div class="quiet-eyebrow">${e(toolkit)} · Engagement Workstream</div>
+          <h1>${e(d.title)}</h1>
+          <p>${e(p.name)} · ${e(p.client)}</p>
+        </div>
+        <div class="button-row">
+          ${badge(d.status)}
+          <a href="#project/${project}" class="btn secondary small-btn">${icon('folder')} Back to engagement</a>
+        </div>
+      </section>
+      ${content}
+    </div>
+  `, 'Engagement Manager', `${p.name} / ${toolkit}`);
 }
 
 function addMember() {
@@ -2556,6 +2648,7 @@ function confirmAction(title, subtitle, form, data) {
    ========================================================================== */
 
 async function route() {
+  closeWorkstreamMenu();
   // If not signed in: always show the Sign-in / Sign-up page first!
   if (!state.user) {
     location.hash = '';
@@ -2573,14 +2666,18 @@ async function route() {
   }
 
   const projectMatch = /^project\/([\w-]+)$/.exec(hash);
+  const workstreamMatch = /^project\/([\w-]+)\/workstream\/([\w-]+)$/.exec(hash);
 
   try {
     if (hash === 'preferences') {
       state.page = 'preferences';
       renderPreferences();
+    } else if (workstreamMatch) {
+      state.page = 'workstream';
+      await renderWorkstream(workstreamMatch[1], workstreamMatch[2]);
     } else if (projectMatch) {
       state.page = 'project';
-      await openProject(projectMatch[1]);
+      await openProject(projectMatch[1], state.project?.project?.id === projectMatch[1]);
     } else if (hash === 'desk') {
       state.page = 'desk';
       await refreshWorkspace();
@@ -2617,6 +2714,7 @@ async function route() {
 async function reloadCurrent() {
   await refreshWorkspace();
   if (state.page === 'project') await openProject(state.project.project.id, true);
+  else if (state.page === 'workstream') await renderWorkstream(state.editingProject, state.editing.id);
   else if (state.page === 'preferences') renderPreferences();
   else if (state.page === 'desk') renderDesk();
   else if (state.page === 'project-setup') renderProjectSetup();
@@ -2646,6 +2744,7 @@ document.addEventListener('click', async event => {
   }
 
   if (state.busy && !['toggle-password', 'close-modal'].includes(action)) return;
+  if (target.closest('.workstream-actions-menu')) closeWorkstreamMenu();
 
   try {
     if (action === 'open-knowledge-tab') {
@@ -2657,6 +2756,8 @@ document.addEventListener('click', async event => {
       openKnowledgeBase();
     } else if (action === 'nav-setup') {
       location.hash = '#project-setup';
+    } else if (action === 'toggle-workstream-menu') {
+      toggleWorkstreamMenu(target);
     } else if (action === 'toggle-user-menu') {
       const dropdown = target.closest('.user-menu-wrap')?.querySelector('.user-menu-dropdown');
       if (dropdown) {
@@ -2735,7 +2836,8 @@ document.addEventListener('click', async event => {
       renderProjectSetup();
     } else if (action === 'project-tab') {
       state.projectTab = target.dataset.tab;
-      renderProject();
+      if (state.page === 'workstream') location.hash = `#project/${state.project.project.id}`;
+      else renderProject();
     } else if (action === 'settings-tab') {
       state.settingsTab = target.dataset.tab;
       await renderSettings();
@@ -2790,6 +2892,21 @@ document.addEventListener('click', async event => {
       toast('Engagement setup saved.');
     } else if (action === 'edit-delivery') {
       await editDelivery(target.dataset.project, target.dataset.id);
+    } else if (action === 'generate-outline') {
+      state.busy = true;
+      target.disabled = true;
+      target.textContent = 'Creating outline…';
+      try {
+        await send(`/projects/${state.editingProject}/deliverables/${state.editing.id}/generate`, { updated: state.editing.updated });
+        await reloadCurrent();
+        toast('Outline created. You can now edit it in the toolkit.');
+      } finally {
+        state.busy = false;
+        if (target.isConnected) {
+          target.disabled = false;
+          target.textContent = state.editing.kind === 'memo' ? 'Create memo outline' : 'Create deck outline';
+        }
+      }
     } else if (action === 'promote-to-final') {
       event.stopPropagation();
       const projectId = target.dataset.project || state.editingProject || state.project?.project?.id;
@@ -2833,6 +2950,15 @@ document.addEventListener('click', async event => {
       toast(`Export saved to Engagement Documents: ${res.name}`);
     } else if (action === 'add-member') {
       addMember();
+    } else if (action === 'delete-workstream') {
+      confirmAction(
+        'Delete this workstream?',
+        `${target.dataset.name} and its draft will be permanently deleted. Saved exports and reference documents will remain in Engagement Documents.`,
+        'delete-workstream-form',
+        `data-project="${e(target.dataset.project)}" data-id="${e(target.dataset.id)}"`
+      );
+      const submit = modalRoot.querySelector('#delete-workstream-form button[type="submit"]');
+      if (submit) submit.innerHTML = `Delete workstream ${icon('trash')}`;
     } else if (action === 'delete-resource') {
       confirmAction(
         'Remove this evidence file?',
@@ -3034,17 +3160,18 @@ document.addEventListener('submit', async event => {
       toast('Evidence added to project repository.');
     } else if (form.id === 'new-memo-form' || form.id === 'new-deck-form') {
       const kind = form.id === 'new-memo-form' ? 'memo' : 'deck';
-      const result = await send(`/projects/${state.project.project.id}/deliverables`, {
+      const projectId = state.project.project.id;
+      await send(`/projects/${projectId}/workstreams`, {
         kind,
         title: values.title,
         resourceIds: data.getAll('resourceIds'),
         params: { ...values, standards: data.getAll('standards') }
       });
-      const projectId = state.project.project.id;
       finishModal();
-      await reloadCurrent();
-      await editDelivery(projectId, result.id);
-      toast('Working outline created.');
+      state.projectTab = 'overview';
+      if (state.page === 'project') await reloadCurrent();
+      else location.hash = `#project/${projectId}`;
+      toast('Workstream set up. Open it from Engagement Workstreams to use the toolkit.');
     } else if (form.id === 'edit-delivery-form') {
       await send(`/projects/${state.editingProject}/deliverables/${state.editing.id}`, {
         ...values,
@@ -3101,6 +3228,11 @@ document.addEventListener('submit', async event => {
       state.setupTab = 'team';
       await reloadCurrent();
       toast('Teammate granted access to project.');
+    } else if (form.id === 'delete-workstream-form') {
+      await api(`/projects/${form.dataset.project}/deliverables/${form.dataset.id}`, { method: 'DELETE' });
+      finishModal();
+      await reloadCurrent();
+      toast('Workstream deleted.');
     } else if (form.id === 'delete-resource-form') {
       await api(`/projects/${state.project.project.id}/resources/${form.dataset.id}`, { method: 'DELETE' });
       finishModal();
@@ -3150,6 +3282,7 @@ document.addEventListener('submit', async event => {
 });
 
 document.addEventListener('click', event => {
+  if (!event.target.closest('.workstream-menu-trigger, .workstream-actions-menu')) closeWorkstreamMenu();
   if (!event.target.closest('.user-menu-wrap')) {
     document.querySelectorAll('.user-menu-dropdown').forEach(d => d.classList.add('hidden'));
     document.querySelectorAll('.user-menu-trigger').forEach(b => b.setAttribute('aria-expanded', 'false'));
@@ -3161,6 +3294,18 @@ document.addEventListener('click', event => {
 });
 
 document.addEventListener('keydown', event => {
+  if (!workstreamMenu.hidden) {
+    if (event.key === 'Escape' || event.key === 'Tab') {
+      closeWorkstreamMenu(true);
+      if (event.key === 'Escape') event.preventDefault();
+    } else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key) && workstreamMenu.contains(event.target)) {
+      event.preventDefault();
+      const items = [...workstreamMenu.querySelectorAll('[role="menuitem"]')];
+      const index = items.indexOf(document.activeElement);
+      const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 : (index + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+      items[next]?.focus();
+    }
+  }
   if (event.key === 'Escape') {
     document.querySelectorAll('.user-menu-dropdown, .notification-menu-dropdown').forEach(d => d.classList.add('hidden'));
     document.querySelectorAll('.user-menu-trigger, .notification-trigger').forEach(b => b.setAttribute('aria-expanded', 'false'));
@@ -3172,6 +3317,9 @@ document.addEventListener('keydown', event => {
     }
   }
 });
+
+window.addEventListener('resize', () => closeWorkstreamMenu());
+document.addEventListener('scroll', () => closeWorkstreamMenu(), true);
 
 window.addEventListener('hashchange', () => {
   if (modalRoot.querySelector('dialog')) closeModal();
