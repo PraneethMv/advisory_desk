@@ -82,12 +82,13 @@ export async function createApp(options = {}) {
     CREATE TABLE IF NOT EXISTS invitations (id TEXT PRIMARY KEY, email TEXT NOT NULL, token TEXT UNIQUE NOT NULL, expires INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, client TEXT NOT NULL, fy TEXT NOT NULL, type TEXT NOT NULL, gaap TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'Active', owner_id TEXT REFERENCES users(id), created TEXT NOT NULL, updated TEXT NOT NULL, project_type TEXT NOT NULL DEFAULT 'Live', client_id TEXT NOT NULL DEFAULT '', engagement_id TEXT NOT NULL DEFAULT '', estimated_completion TEXT NOT NULL DEFAULT '', sub_type TEXT NOT NULL DEFAULT '');
     CREATE TABLE IF NOT EXISTS memberships (project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, user_id TEXT REFERENCES users(id) ON DELETE CASCADE, role TEXT NOT NULL DEFAULT 'Team Member', PRIMARY KEY(project_id,user_id));
-    CREATE TABLE IF NOT EXISTS resources (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, name TEXT NOT NULL, kind TEXT NOT NULL, size INTEGER NOT NULL, content BLOB NOT NULL, text TEXT NOT NULL DEFAULT '', created_by TEXT REFERENCES users(id), created TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS deliverables (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, kind TEXT NOT NULL, title TEXT NOT NULL, params TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Draft', created_by TEXT REFERENCES users(id), created TEXT NOT NULL, updated TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS resources (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, name TEXT NOT NULL, kind TEXT NOT NULL, size INTEGER NOT NULL, content BLOB NOT NULL, text TEXT NOT NULL DEFAULT '', created_by TEXT REFERENCES users(id), created TEXT NOT NULL, workstream_id TEXT DEFAULT NULL);
+    CREATE TABLE IF NOT EXISTS deliverables (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, kind TEXT NOT NULL, title TEXT NOT NULL, params TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Draft', created_by TEXT REFERENCES users(id), created TEXT NOT NULL, updated TEXT NOT NULL, is_final INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS activity (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, user_id TEXT REFERENCES users(id), action TEXT NOT NULL, created TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires);
     CREATE INDEX IF NOT EXISTS resources_project ON resources(project_id);
+    CREATE INDEX IF NOT EXISTS resources_workstream ON resources(workstream_id);
     CREATE INDEX IF NOT EXISTS deliverables_project ON deliverables(project_id);
     CREATE INDEX IF NOT EXISTS activity_project ON activity(project_id);
   `);
@@ -131,6 +132,16 @@ export async function createApp(options = {}) {
   };
   ensureMembershipColumn('role', "TEXT NOT NULL DEFAULT 'Team Member'");
   db.prepare("UPDATE memberships SET role='Engagement Manager' WHERE user_id IN (SELECT owner_id FROM projects WHERE id=memberships.project_id) AND (role='Team Member' OR role IS NULL OR role='')").run();
+
+  const deliverableColumns = new Set(db.prepare('PRAGMA table_info(deliverables)').all().map(column => column.name));
+  if (!deliverableColumns.has('is_final')) {
+    db.exec('ALTER TABLE deliverables ADD COLUMN is_final INTEGER NOT NULL DEFAULT 0');
+  }
+
+  const resourceColumns = new Set(db.prepare('PRAGMA table_info(resources)').all().map(column => column.name));
+  if (!resourceColumns.has('workstream_id')) {
+    db.exec('ALTER TABLE resources ADD COLUMN workstream_id TEXT DEFAULT NULL');
+  }
 
   db.prepare('INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)').run('workspace', JSON.stringify(DEFAULT_SETTINGS));
   const getSettings = () => JSON.parse(db.prepare('SELECT value FROM settings WHERE key=?').get('workspace').value);
@@ -222,12 +233,17 @@ export async function createApp(options = {}) {
       const project = createProject(user, { name: f[0], client: f[1], type: f[2], gaap: f[3], description: f[4], fy: '2027-03-31' });
       if (i === 5) db.prepare('UPDATE projects SET status=? WHERE id=?').run('Completed', project.id);
       const contents = Buffer.from(`# ${f[1]} — sample engagement brief\n\nFictional demonstration data.\n\n${f[4]}\n\nScope and assumptions to be agreed with the engagement team.`);
-      db.prepare('INSERT INTO resources VALUES (?,?,?,?,?,?,?,?,?)').run(randomUUID(), project.id, 'Engagement brief.md', 'reference', contents.length, contents, contents.toString(), user.id, now());
+      db.prepare('INSERT INTO resources (id, project_id, name, kind, size, content, text, created_by, created) VALUES (?,?,?,?,?,?,?,?,?)').run(randomUUID(), project.id, 'Engagement brief.md', 'reference', contents.length, contents, contents.toString(), user.id, now());
       if (i < 4) {
         const kind = i === 1 || i === 2 ? 'deck' : 'memo';
         const params = kind === 'memo' ? { gaap: f[3], standards: [STANDARD_CATALOG[f[3]][i === 0 ? 3 : 7]], problem: f[4] } : { deckType: 'Proposal', area: i === 1 ? 'GAAP transition' : 'IPO', problem: f[4], ipoTrack: i === 2 ? 'Readiness' : '', currentGaap: i === 1 ? 'Other' : '', targetGaap: 'Ind AS' };
         const draft = buildDraft({ kind, title: f[0], params, project, resources: [] });
-        db.prepare('INSERT INTO deliverables VALUES (?,?,?,?,?,?,?,?,?,?)').run(randomUUID(), project.id, kind, f[0], JSON.stringify(params), draft.body, i === 0 || i === 2 ? 'In review' : 'Draft', user.id, now(), now());
+        const isFinalVal = i === 2 ? 1 : 0;
+        const workstreamId = randomUUID();
+        const createdNow = now();
+        db.prepare('INSERT INTO deliverables (id, project_id, kind, title, params, body, status, created_by, created, updated, is_final) VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(workstreamId, project.id, kind, f[0], JSON.stringify(params), draft.body, isFinalVal ? 'Final' : (i === 0 ? 'In review' : 'Draft'), user.id, createdNow, createdNow, isFinalVal);
+        const draftBuf = Buffer.from(draft.body, 'utf8');
+        db.prepare('INSERT INTO resources (id, project_id, name, kind, size, content, text, created_by, created, workstream_id) VALUES (?,?,?,?,?,?,?,?,?,?)').run(randomUUID(), project.id, `${f[0]}.md`, 'draft', draftBuf.length, draftBuf, draft.body, user.id, createdNow, workstreamId);
         activity(project.id, user.id, `Created a ${kind === 'memo' ? 'technical memo' : 'slide deck'} outline`);
       }
     });
@@ -323,7 +339,7 @@ export async function createApp(options = {}) {
       }
       if (path === '/api/projects' && method === 'POST') { const input = await payload(req); const project = transaction(() => createProject(user, input)); respond(res, 201, { project }); return; }
       if (path === '/api/deliverables' && method === 'GET') {
-        respond(res, 200, { deliverables: db.prepare('SELECT d.id,d.project_id,d.kind,d.title,d.status,d.created,d.updated,p.name AS project_name,p.client FROM deliverables d JOIN projects p ON p.id=d.project_id JOIN memberships m ON m.project_id=p.id WHERE m.user_id=? ORDER BY d.updated DESC').all(user.id) }); return;
+        respond(res, 200, { deliverables: db.prepare('SELECT d.id,d.project_id,d.kind,d.title,d.status,d.created,d.updated,d.created_by,d.is_final,p.name AS project_name,p.client FROM deliverables d JOIN projects p ON p.id=d.project_id JOIN memberships m ON m.project_id=p.id WHERE m.user_id=? ORDER BY d.updated DESC').all(user.id) }); return;
       }
       if (path === '/api/activity' && method === 'GET') {
         respond(res, 200, { activity: db.prepare('SELECT a.*,u.name AS user_name,p.name AS project_name FROM activity a JOIN users u ON u.id=a.user_id JOIN projects p ON p.id=a.project_id JOIN memberships m ON m.project_id=p.id WHERE m.user_id=? ORDER BY a.created DESC LIMIT 100').all(user.id) }); return;
@@ -362,8 +378,8 @@ export async function createApp(options = {}) {
         if (!suffix && method === 'GET') {
           respond(res, 200, {
             project,
-            resources: db.prepare('SELECT id,name,kind,size,created,created_by FROM resources WHERE project_id=? ORDER BY created DESC').all(project.id),
-            deliverables: db.prepare('SELECT id,kind,title,status,created,updated FROM deliverables WHERE project_id=? ORDER BY updated DESC').all(project.id),
+            resources: db.prepare('SELECT id,name,kind,size,created,created_by,workstream_id FROM resources WHERE project_id=? ORDER BY created DESC').all(project.id),
+            deliverables: db.prepare('SELECT id,kind,title,status,created,updated,created_by,is_final FROM deliverables WHERE project_id=? ORDER BY updated DESC').all(project.id),
             members: db.prepare("SELECT u.id,u.name,u.email,u.designation,m.role FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.project_id=? ORDER BY CASE WHEN m.role='Engagement Manager' THEN 1 WHEN m.role='Reviewer' THEN 2 ELSE 3 END, u.name ASC").all(project.id),
             activity: db.prepare('SELECT a.*,u.name AS user_name FROM activity a JOIN users u ON u.id=a.user_id WHERE project_id=? ORDER BY created DESC LIMIT 40').all(project.id)
           });
@@ -495,7 +511,7 @@ export async function createApp(options = {}) {
           requireValue(typeof input.content === 'string' && /^[A-Za-z0-9+/]*={0,2}$/.test(input.content) && input.content.length % 4 === 0, 'Invalid file content.');
           const content = Buffer.from(input.content, 'base64'); requireValue(content.length > 0 && content.length <= 10 * 1024 * 1024, 'Files must be between 1 byte and 10 MB.');
           const id = randomUUID(); const text = /\.(md|txt|csv|json)$/i.test(name) ? content.toString('utf8').slice(0, 100000) : '';
-          transaction(() => { db.prepare('INSERT INTO resources VALUES (?,?,?,?,?,?,?,?,?)').run(id, project.id, name, input.kind, content.length, content, text, user.id, now()); db.prepare('UPDATE projects SET updated=? WHERE id=?').run(now(), project.id); activity(project.id, user.id, `Added resource: ${name}`); }); respond(res, 201, { id }); return;
+          transaction(() => { db.prepare('INSERT INTO resources (id, project_id, name, kind, size, content, text, created_by, created) VALUES (?,?,?,?,?,?,?,?,?)').run(id, project.id, name, input.kind, content.length, content, text, user.id, now()); db.prepare('UPDATE projects SET updated=? WHERE id=?').run(now(), project.id); activity(project.id, user.id, `Added resource: ${name}`); }); respond(res, 201, { id }); return;
         }
         const resourceMatch = /^resources\/([\w-]+)$/.exec(suffix);
         if (resourceMatch && ['GET', 'DELETE'].includes(method)) {
@@ -532,7 +548,54 @@ export async function createApp(options = {}) {
           const resources = resourceIds.map(id => { const r = db.prepare('SELECT id,name,kind,text FROM resources WHERE id=? AND project_id=?').get(id, project.id); requireValue(r, 'A selected resource is outside this project or unavailable.', 403); return r; });
           params.resourceIds = resourceIds;
           const draft = buildDraft({ kind: input.kind, title, params, project, resources, settings: getSettings() }); const id = randomUUID();
-          transaction(() => { db.prepare('INSERT INTO deliverables VALUES (?,?,?,?,?,?,?,?,?,?)').run(id, project.id, input.kind, title, JSON.stringify(params), draft.body, 'Draft', user.id, now(), now()); db.prepare('UPDATE projects SET updated=? WHERE id=?').run(now(), project.id); activity(project.id, user.id, `Created ${input.kind === 'memo' ? 'memo' : 'deck'} outline: ${title}`); }); respond(res, 201, { id }); return;
+          const docId = randomUUID();
+          const docName = `${title}.md`;
+          const draftContent = Buffer.from(draft.body, 'utf8');
+          const createdTime = now();
+          transaction(() => {
+            db.prepare('INSERT INTO deliverables (id, project_id, kind, title, params, body, status, created_by, created, updated, is_final) VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(
+              id, project.id, input.kind, title, JSON.stringify(params), draft.body, 'Draft', user.id, createdTime, createdTime, 0
+            );
+            db.prepare('INSERT INTO resources (id, project_id, name, kind, size, content, text, created_by, created, workstream_id) VALUES (?,?,?,?,?,?,?,?,?,?)').run(
+              docId, project.id, docName, 'draft', draftContent.length, draftContent, draft.body, user.id, createdTime, id
+            );
+            db.prepare('UPDATE projects SET updated=? WHERE id=?').run(createdTime, project.id);
+            activity(project.id, user.id, `Created ${input.kind === 'memo' ? 'memo' : 'deck'} outline: ${title}`);
+          });
+          respond(res, 201, { id, resourceId: docId });
+          return;
+        }
+        const finalizeMatch = /^deliverables\/([\w-]+)\/finalize$/.exec(suffix);
+        if (finalizeMatch && method === 'POST') {
+          const delivery = db.prepare('SELECT * FROM deliverables WHERE id=? AND project_id=?').get(finalizeMatch[1], project.id);
+          requireValue(delivery, 'Deliverable not found.', 404);
+          const updated = new Date(Math.max(Date.now(), Date.parse(delivery.updated) + 1)).toISOString();
+          transaction(() => {
+            db.prepare("UPDATE deliverables SET is_final=1, status='Final', updated=? WHERE id=? AND project_id=?").run(updated, delivery.id, project.id);
+            db.prepare('UPDATE projects SET updated=? WHERE id=?').run(updated, project.id);
+            activity(project.id, user.id, `Moved ${delivery.title} to Final Deliverables`);
+          });
+          respond(res, 200, { ok: true, is_final: 1, status: 'Final' });
+          return;
+        }
+        const saveExportMatch = /^deliverables\/([\w-]+)\/save-to-documents$/.exec(suffix);
+        if (saveExportMatch && method === 'POST') {
+          const delivery = db.prepare('SELECT * FROM deliverables WHERE id=? AND project_id=?').get(saveExportMatch[1], project.id);
+          requireValue(delivery, 'Deliverable not found.', 404);
+          const input = await payload(req).catch(() => ({}));
+          const format = input.format === 'docx' || input.format === 'pptx' ? input.format : (delivery.kind === 'memo' ? 'docx' : 'pptx');
+          const exported = exportDocument(delivery, format);
+          const docId = randomUUID();
+          const docName = `${delivery.title.replace(/[^\p{L}\p{N} _-]/gu, '').slice(0, 100) || 'deliverable'}.${format}`;
+          transaction(() => {
+            db.prepare('INSERT INTO resources (id, project_id, name, kind, size, content, text, created_by, created, workstream_id) VALUES (?,?,?,?,?,?,?,?,?,?)').run(
+              docId, project.id, docName, 'export', exported.bytes.length, exported.bytes, delivery.body, delivery.created_by, delivery.created, delivery.id
+            );
+            db.prepare('UPDATE projects SET updated=? WHERE id=?').run(now(), project.id);
+            activity(project.id, user.id, `Added export to engagement documents: ${docName}`);
+          });
+          respond(res, 201, { ok: true, id: docId, name: docName });
+          return;
         }
         const deliveryMatch = /^deliverables\/([\w-]+)(?:\/export\/(md|docx|pptx))?$/.exec(suffix);
         if (deliveryMatch) {
@@ -546,10 +609,31 @@ export async function createApp(options = {}) {
           if (method === 'GET' && !deliveryMatch[2]) { respond(res, 200, { deliverable: { ...delivery, params: JSON.parse(delivery.params) } }); return; }
           if (method === 'PATCH' && !deliveryMatch[2]) {
             const input = await payload(req); const title = textField(input.title, 'Title', 160); const body = textField(input.body, 'Content', 200000);
-            requireValue(['Draft', 'In review', 'Approved'].includes(input.status), 'Choose a valid review status.');
+            requireValue(['Draft', 'In review', 'Approved', 'Final'].includes(input.status), 'Choose a valid review status.');
             requireValue(input.updated === delivery.updated, 'This draft was updated by someone else. Reopen it before saving.', 409);
+            const isFinalVal = input.is_final !== undefined ? (input.is_final ? 1 : 0) : (input.status === 'Final' ? 1 : delivery.is_final);
             const updated = new Date(Math.max(Date.now(), Date.parse(delivery.updated) + 1)).toISOString();
-            transaction(() => { db.prepare('UPDATE deliverables SET title=?,body=?,status=?,updated=? WHERE id=? AND project_id=?').run(title, body, input.status, updated, delivery.id, project.id); db.prepare('UPDATE projects SET updated=? WHERE id=?').run(updated, project.id); activity(project.id, user.id, `Updated ${title} · ${input.status}`); }); respond(res, 200, { ok: true }); return;
+            transaction(() => {
+              db.prepare('UPDATE deliverables SET title=?,body=?,status=?,updated=?,is_final=? WHERE id=? AND project_id=?').run(
+                title, body, input.status, updated, isFinalVal, delivery.id, project.id
+              );
+              // Sync corresponding draft document in resources
+              const draftDoc = db.prepare('SELECT id FROM resources WHERE workstream_id=? AND project_id=?').get(delivery.id, project.id);
+              const draftBytes = Buffer.from(body, 'utf8');
+              if (draftDoc) {
+                db.prepare('UPDATE resources SET name=?, size=?, content=?, text=? WHERE id=?').run(
+                  `${title}.md`, draftBytes.length, draftBytes, body, draftDoc.id
+                );
+              } else {
+                db.prepare('INSERT INTO resources (id, project_id, name, kind, size, content, text, created_by, created, workstream_id) VALUES (?,?,?,?,?,?,?,?,?,?)').run(
+                  randomUUID(), project.id, `${title}.md`, 'draft', draftBytes.length, draftBytes, body, delivery.created_by, delivery.created, delivery.id
+                );
+              }
+              db.prepare('UPDATE projects SET updated=? WHERE id=?').run(updated, project.id);
+              activity(project.id, user.id, isFinalVal && !delivery.is_final ? `Moved ${title} to Final Deliverables` : `Updated ${title} · ${input.status}`);
+            });
+            respond(res, 200, { ok: true, is_final: isFinalVal });
+            return;
           }
         }
       }

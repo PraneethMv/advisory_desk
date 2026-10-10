@@ -231,16 +231,21 @@ test('topbar includes notifications button and dropdown with sample notification
   assert.match(appJs, /Your Engagement Manager \$\{mgr\} has invited you to an engagement\. Please open Advisory Desk to view/);
   assert.match(appJs, /Knowledge Base: New additions to the IPO Knowledge Base Resources/);
 
-  // Verify notifications placed in topbar structures (shell, workbench, splash)
-  assert.match(appJs, /<header class="topbar">[\s\S]*?<div class="topbar-left">[\s\S]*?\$\{notificationMenuDropdown\(\)\}/);
-  assert.match(appJs, /<header class="workbench-topbar">[\s\S]*?<div class="workbench-topbar-left">[\s\S]*?\$\{notificationMenuDropdown\(\)\}/);
-  assert.match(appJs, /<header class="splash-topbar">[\s\S]*?<div class="splash-topbar-left">[\s\S]*?\$\{notificationMenuDropdown\(\)\}/);
+  // Verify notifications placed on right side of topbar structures (shell, workbench, splash)
+  assert.match(appJs, /<header class="topbar">[\s\S]*?<div class="topbar-right">[\s\S]*?\$\{notificationMenuDropdown\(\)\}/);
+  assert.match(appJs, /<header class="workbench-topbar">[\s\S]*?<div class="workbench-topbar-right">[\s\S]*?\$\{notificationMenuDropdown\(\)\}/);
+  assert.match(appJs, /<header class="splash-topbar">[\s\S]*?<div class="splash-top-right">[\s\S]*?\$\{notificationMenuDropdown\(\)\}/);
+
+  // Verify 'Notifications' label removed, leaving only bell icon and counter
+  assert.equal(appJs.includes('<span class="notification-trigger-text">Notifications</span>'), false);
+  // Verify 'Private workspace' badge removed from topbar
+  assert.equal(appJs.includes('Private workspace'), false);
 
   // Verify CSS styles exist
   assert.match(stylesCss, /\.notification-menu-wrap/);
   assert.match(stylesCss, /\.notification-trigger/);
   assert.match(stylesCss, /\.notification-menu-dropdown/);
-  assert.match(stylesCss, /\.topbar-left/);
+  assert.match(stylesCss, /\.topbar-right/);
 });
 
 test('workbench renders Create Engagement button in page-heading and out of the empty banner ribbon', async () => {
@@ -269,7 +274,7 @@ test('configure new project dialog renders in landscape pop-up layout', async ()
   assert.match(stylesCss, /\.landscape-modal-grid\s*\{[\s\S]*?grid-template-columns:\s*1fr\s+1fr;/);
 });
 
-test('project sidebar is divided into Workspace, Toolkit, and Return to Hub, with username/signout removed', async () => {
+test('project sidebar is divided into Workspace and Toolkit with Return to Hub and private banner removed from sidebar', async () => {
   const appJs = await readFile(resolve('public/app.js'), 'utf8');
   const stylesCss = await readFile(resolve('public/styles.css'), 'utf8');
 
@@ -287,12 +292,11 @@ test('project sidebar is divided into Workspace, Toolkit, and Return to Hub, wit
   assert.match(appJs, /<span>Slide Decks<\/span>/);
   assert.match(appJs, /<span>FS Helper<\/span>/);
 
-  // Verify Return to Hub at the bottom of the sidebar
-  assert.match(appJs, /<a href="#hub" class="nav-link return-hub-link">[\s\S]*?Return to Hub/);
-
-  // Verify .profile (username/signout) is completely removed from shell sidebar
+  // Verify Return to Hub, private banner, and profile are removed from shell sidebar
   const shellMatch = appJs.match(/function shell\(content, title = 'Projects', trail = ''\) \{([\s\S]*?)app\.innerHTML/);
   assert.ok(shellMatch);
+  assert.equal(shellMatch[1].includes('return-hub-link'), false);
+  assert.equal(shellMatch[1].includes('class="private-note"'), false);
   assert.equal(shellMatch[1].includes('class="profile"'), false);
 
   // Verify renderProject does not render back-link or horizontal project-tabs
@@ -477,5 +481,154 @@ test('backend API supports engagement parameters, project general updates, and t
   const seniorUpdated = getUpdated.body.members.find(m => m.email === 'senior@example.test');
   assert.equal(seniorUpdated.role, 'Team Member');
 });
+
+test('project dashboard features uncluttered 3-section layout and toolkit pop-up modal', async () => {
+  const appJs = await readFile(resolve('public/app.js'), 'utf8');
+  const stylesCss = await readFile(resolve('public/styles.css'), 'utf8');
+
+  // Verify dashboard contains 3 standalone section headings
+  assert.match(appJs, /<h2 id="workstreams-heading">Engagement Workstreams<\/h2>/);
+  assert.match(appJs, /<h2 id="documents-heading">Engagement Documents<\/h2>/);
+  assert.match(appJs, /<h2 id="brief-heading">Project Brief<\/h2>/);
+
+  // Verify buttons on the same line as headings
+  assert.match(appJs, /Engagement Workstreams[\s\S]*?'open-workstream-modal'[\s\S]*?New/);
+  assert.match(appJs, /Engagement Documents[\s\S]*?'upload-resource'[\s\S]*?Upload/);
+
+  // Verify empty banner texts
+  assert.match(appJs, /No workstreams created\. Select <strong>New<\/strong> to start/);
+  assert.match(appJs, /No documents added/);
+
+  // Verify Project Brief has standalone heading and is not embedded inside the card
+  const overviewMatch = appJs.match(/activeTab === 'overview'\) \{([\s\S]*?)\} else if \(activeTab === 'resources'/);
+  assert.ok(overviewMatch);
+  assert.equal(overviewMatch[1].includes('<div class="panel-heading">\n            <h2>Project Parameters & Brief'), false, 'Heading should not be embedded inside panel');
+  assert.match(overviewMatch[1], /class="panel project-brief-panel"/);
+
+  // Verify openWorkstreamModal function renders 3 toolkits in a pop-up dialog
+  assert.match(appJs, /function openWorkstreamModal\(\)\s*\{/);
+  assert.match(appJs, /'Engagement Toolkits'/);
+  assert.match(appJs, /'toolkit-dialog'/);
+  assert.match(appJs, /Memo Builder[\s\S]*?data-action="new-memo"/);
+  assert.match(appJs, /Slide Decks[\s\S]*?data-action="new-deck"/);
+  assert.match(appJs, /FS Helper[\s\S]*?Planned for Phase 2/);
+
+  // Verify table headers with Created By and Created Time
+  assert.match(appJs, /WORKSTREAM[\s\S]*?TYPE[\s\S]*?STATUS[\s\S]*?CREATED BY[\s\S]*?CREATED TIME/);
+  assert.match(appJs, /DOCUMENT[\s\S]*?SIZE[\s\S]*?ADDED BY[\s\S]*?CREATED TIME/);
+  assert.match(appJs, /class="section-heading standalone-section-heading with-action"/);
+
+  // Verify CSS styles
+  assert.match(stylesCss, /\.dashboard-sections\s*\{/);
+  assert.match(stylesCss, /\.section-heading\.with-action\s*\{/);
+  assert.match(stylesCss, /\.standalone-section-heading\s*\{/);
+  assert.match(stylesCss, /\.empty-list-banner\s*\{/);
+  assert.match(stylesCss, /\.workstream-list\s*\{/);
+  assert.match(stylesCss, /\.workstream-row\s*\{/);
+  assert.match(stylesCss, /\.workstream-col-author/);
+  assert.match(stylesCss, /\.workstream-col-time/);
+  assert.match(stylesCss, /\.document-col-time/);
+  assert.match(stylesCss, /\.project-brief-panel\s*\{/);
+  assert.match(stylesCss, /dialog\.modal\.toolkit-dialog\s*\{/);
+  assert.match(stylesCss, /\.toolkit-modal-grid\s*\{/);
+  assert.match(stylesCss, /\.toolkit-modal-card\s*\{/);
+});
+
+test('workstream draft file only gets added to engagement documents and inherits metadata; moved to final only on explicit action', async () => {
+  const usr = client();
+  const signInRes = await usr.request('/auth/login', 'POST', { email: 'owner@example.test', password: 'correct horse battery staple' });
+  assert.equal(signInRes.status, 200);
+
+  // Create engagement
+  const projectRes = await usr.request('/projects', 'POST', {
+    name: 'Technical Memo Project',
+    client: 'Acme Corp',
+    fy: '2027-03-31',
+    type: 'Technical memo',
+    gaap: 'US GAAP'
+  });
+  assert.equal(projectRes.status, 201);
+  const projectId = projectRes.body.project.id;
+
+  // Create memo workstream
+  const memoRes = await usr.request(`/projects/${projectId}/deliverables`, 'POST', {
+    kind: 'memo',
+    title: 'ASC 606 Revenue Allocation Analysis',
+    resourceIds: [],
+    params: {
+      problem: 'Analyze multi-element transaction price allocation under ASC 606.',
+      gaap: 'US GAAP',
+      standards: ['ASC 606 Revenue from Contracts with Customers']
+    }
+  });
+  assert.equal(memoRes.status, 201);
+  const deliverableId = memoRes.body.id;
+
+  // Retrieve project: verify workstream is not final, but draft file is in resources
+  const projectData = await usr.request(`/projects/${projectId}`);
+  assert.equal(projectData.status, 200);
+  const deliv = projectData.body.deliverables.find(d => d.id === deliverableId);
+  assert.ok(deliv);
+  assert.equal(deliv.is_final, 0, 'Draft workstream must not be final');
+  assert.equal(deliv.status, 'Draft');
+
+  // Verify draft file is added to resources with matching author and creation time
+  const draftDoc = projectData.body.resources.find(r => r.workstream_id === deliverableId && r.kind === 'draft');
+  assert.ok(draftDoc, 'Draft .md file must be present in engagement documents');
+  assert.equal(draftDoc.name, 'ASC 606 Revenue Allocation Analysis.md');
+  assert.equal(draftDoc.created_by, deliv.created_by);
+  assert.equal(draftDoc.created, deliv.created);
+
+  // Save export (.docx) to engagement documents
+  const saveExportRes = await usr.request(`/projects/${projectId}/deliverables/${deliverableId}/save-to-documents`, 'POST', {
+    format: 'docx'
+  });
+  assert.equal(saveExportRes.status, 201);
+  assert.ok(saveExportRes.body.name.endsWith('.docx'));
+
+  // Check resources has export document, and deliverable is still not final
+  const afterExportData = await usr.request(`/projects/${projectId}`);
+  const exportDoc = afterExportData.body.resources.find(r => r.kind === 'export' && r.workstream_id === deliverableId);
+  assert.ok(exportDoc, 'Export file must be added to engagement documents');
+  assert.equal(exportDoc.created_by, deliv.created_by);
+  assert.equal(afterExportData.body.deliverables.find(d => d.id === deliverableId).is_final, 0);
+
+  // Finalize deliverable (explicit "Move to Final Deliverables")
+  const finalizeRes = await usr.request(`/projects/${projectId}/deliverables/${deliverableId}/finalize`, 'POST');
+  assert.equal(finalizeRes.status, 200);
+  assert.equal(finalizeRes.body.is_final, 1);
+  assert.equal(finalizeRes.body.status, 'Final');
+
+  // Confirm it is now marked final in project deliverables
+  const finalProjectData = await usr.request(`/projects/${projectId}`);
+  const finalizedDeliv = finalProjectData.body.deliverables.find(d => d.id === deliverableId);
+  assert.equal(finalizedDeliv.is_final, 1);
+  assert.equal(finalizedDeliv.status, 'Final');
+
+  // Verify UI code behavior and bindings
+  const appJs = await readFile(resolve('public/app.js'), 'utf8');
+  const stylesCss = await readFile(resolve('public/styles.css'), 'utf8');
+
+  // Verify sidebar counts only final deliverables
+  assert.match(appJs, /finalDeliverablesCount\s*=\s*isProject\s*\?\s*\(projectData\.deliverables\?\.filter\(d\s*=>\s*Boolean\(d\.is_final\)\)\?\.length/);
+  assert.match(appJs, /projectTabNav\('deliverables',\s*'Final Deliverables',\s*'slides',\s*finalDeliverablesCount\)/);
+
+  // Verify deliverables tab filters to is_final
+  assert.match(appJs, /finalDeliverables\s*=\s*\(data\.deliverables\s*\|\|\s*\[\]\)\.filter\(d\s*=>\s*Boolean\(d\.is_final\)\)/);
+
+  // Verify Move to Final button in workstream table row and editor modal
+  assert.match(appJs, /data-action="promote-to-final"/);
+  assert.match(appJs, /Move to Final Deliverables/);
+
+  // Verify Save to Documents button in editor toolbar
+  assert.match(appJs, /data-action="save-export-to-documents"/);
+  assert.match(appJs, /Save \$\{d\.kind === 'memo' \? 'Word \(\.docx\)' : 'Deck \(\.pptx\)'\} to Documents/);
+
+  // Verify CSS styles for action buttons and chips
+  assert.match(stylesCss, /\.move-final-action-btn\s*\{/);
+  assert.match(stylesCss, /\.final-chip\s*\{/);
+});
+
+
 
 
