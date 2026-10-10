@@ -7,6 +7,7 @@ const state = {
   standards: {},
   projects: [],
   deliverables: [],
+  notifications: null,
   page: 'hub',
   project: null,
   projectTab: 'overview',
@@ -18,6 +19,7 @@ const state = {
   settingsTab: 'workspace',
   authTab: 'login',
   authStatus: {},
+  setupTab: 'general',
   busy: false
 };
 
@@ -25,11 +27,63 @@ const e = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;',
 const initials = name => String(name || '').split(/\s+/).slice(0, 2).map(x => x[0]).join('').toUpperCase();
 const types = ['Technical memo', 'GAAP transition', 'IPO advisory', 'Accounting advisory', 'Staff augmentation', 'Training'];
 const frameworks = ['IFRS', 'Ind AS', 'US GAAP', 'Other'];
+const designations = ['Intern', 'Associate', 'Senior Associate', 'Assistant Manager', 'Manager', 'Associate Director', 'Director'];
+
+const engagementTypes = [
+  'Accounting Advisory',
+  'IPO Advisory',
+  'Loan Staffing',
+  'Training'
+];
+
+const engagementSubTypes = {
+  'Accounting Advisory': ['Technical Memo', 'Other General Advisory'],
+  'IPO Advisory': ['Readiness', 'PMO'],
+  'Loan Staffing': ['General'],
+  'Training': ['General']
+};
+
+const setupFrameworks = ['Ind AS', 'IFRS', 'IGAAP', 'USGAAP', 'Others'];
+
+function normalizeEngagementType(t) {
+  if (!t) return 'Accounting Advisory';
+  if (t === 'Technical memo' || t === 'GAAP transition' || t === 'Accounting advisory') return 'Accounting Advisory';
+  if (t === 'Staff augmentation') return 'Loan Staffing';
+  if (engagementTypes.includes(t)) return t;
+  return 'Accounting Advisory';
+}
+
+function normalizeFramework(f) {
+  if (!f) return 'Ind AS';
+  if (f === 'US GAAP') return 'USGAAP';
+  if (f === 'Other') return 'Others';
+  if (setupFrameworks.includes(f)) return f;
+  return f;
+}
+
 const date = value => new Intl.DateTimeFormat('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }).format(new Date(value));
+const formatDateTime = value => {
+  if (!value) return '—';
+  try {
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return String(value);
+    return new Intl.DateTimeFormat('en-IN', {
+      day: 'numeric',
+      month: 'short',
+      year: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true
+    }).format(d);
+  } catch {
+    return String(value);
+  }
+};
 const size = bytes => bytes < 1024 ? `${bytes} B` : bytes < 1048576 ? `${Math.round(bytes / 1024)} KB` : `${(bytes / 1048576).toFixed(1)} MB`;
 
 const paths = {
   grid: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
+  dashboard: '<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>',
   folder: '<path d="M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/>',
   file: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6M8 13h8M8 17h5"/>',
   slides: '<rect x="3" y="3" width="18" height="14" rx="2"/><path d="M12 17v4m-4 0h8M7 8h10M7 12h6"/>',
@@ -64,7 +118,8 @@ const paths = {
   hub: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
   sun: '<circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>',
   moon: '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
-  chevronDown: '<path d="m6 9 6 6 6-6"/>'
+  chevronDown: '<path d="m6 9 6 6 6-6"/>',
+  bell: '<path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/>'
 };
 
 const icon = (name, cls = '') => `<svg class="icon ${cls}" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.file}</svg>`;
@@ -88,6 +143,11 @@ function applyTheme(theme) {
   });
   document.querySelectorAll('.theme-icon-indicator').forEach(el => {
     el.innerHTML = theme === 'dark' ? icon('sun') : icon('moon');
+  });
+  document.querySelectorAll('.auth-theme-toggle').forEach(el => {
+    const label = theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode';
+    el.setAttribute('aria-label', label);
+    el.setAttribute('title', label);
   });
 }
 
@@ -125,6 +185,228 @@ function userMenuDropdown() {
           ${icon('logout')}
           <span>Sign out</span>
         </button>
+      </div>
+    </div>
+  `;
+}
+
+function getEngagementManagerName() {
+  if (state.projects && state.projects.length > 0) {
+    const p = state.projects.find(proj => proj.owner_name && proj.owner_name !== state.user?.name);
+    if (p && p.owner_name) return p.owner_name;
+    if (state.projects[0].owner_name) return state.projects[0].owner_name;
+  }
+  return 'Sarah Jenkins';
+}
+
+function getDefaultNotifications() {
+  const mgr = getEngagementManagerName();
+  return [
+    {
+      id: 'notif-advisory-invite',
+      category: 'Advisory Desk',
+      tone: 'tone-blue',
+      icon: 'briefcase',
+      title: 'Engagement Invitation',
+      message: `Advisory Desk: Your Engagement Manager ${mgr} has invited you to an engagement. Please open Advisory Desk to view`,
+      time: '12m ago',
+      read: false,
+      targetAction: 'nav-desk',
+      targetHash: '#desk'
+    },
+    {
+      id: 'notif-kb-ipo',
+      category: 'Knowledge Base',
+      tone: 'tone-red',
+      icon: 'book',
+      title: 'Resource Update',
+      message: 'Knowledge Base: New additions to the IPO Knowledge Base Resources',
+      time: '1h ago',
+      read: false,
+      targetAction: 'nav-knowledge',
+      targetHash: '#knowledge-base'
+    }
+  ];
+}
+
+function getNotifications() {
+  if (!state.notifications) {
+    const key = `advisory_notifications_${state.user?.email || 'guest'}`;
+    const saved = localStorage.getItem(key);
+    if (saved) {
+      try {
+        state.notifications = JSON.parse(saved);
+      } catch {
+        state.notifications = null;
+      }
+    }
+    if (!state.notifications || !Array.isArray(state.notifications) || state.notifications.length === 0) {
+      state.notifications = getDefaultNotifications();
+      saveNotifications();
+    }
+  }
+  return state.notifications;
+}
+
+function saveNotifications() {
+  const key = `advisory_notifications_${state.user?.email || 'guest'}`;
+  try {
+    localStorage.setItem(key, JSON.stringify(state.notifications || []));
+  } catch {}
+}
+
+function getUnreadNotificationCount() {
+  return getNotifications().filter(n => !n.read).length;
+}
+
+function markAllNotificationsAsRead() {
+  const notifs = getNotifications();
+  let changed = false;
+  notifs.forEach(n => {
+    if (!n.read) {
+      n.read = true;
+      changed = true;
+    }
+  });
+  if (changed) {
+    saveNotifications();
+    updateNotificationsUI();
+    toast('All notifications marked as read.');
+  }
+}
+
+function markNotificationAsRead(id) {
+  const notifs = getNotifications();
+  const item = notifs.find(n => n.id === id);
+  if (item && !item.read) {
+    item.read = true;
+    saveNotifications();
+    updateNotificationsUI();
+    toast('Notification marked as read.');
+  }
+}
+
+function openNotification(id) {
+  const notifs = getNotifications();
+  const item = notifs.find(n => n.id === id);
+  if (!item) return;
+
+  if (!item.read) {
+    item.read = true;
+    saveNotifications();
+    updateNotificationsUI();
+  }
+
+  document.querySelectorAll('.notification-menu-dropdown').forEach(d => d.classList.add('hidden'));
+  document.querySelectorAll('.notification-trigger').forEach(b => b.setAttribute('aria-expanded', 'false'));
+
+  if (item.targetAction === 'nav-desk' || item.targetHash === '#desk') {
+    if (location.hash === '#desk') {
+      renderDesk();
+    } else {
+      location.hash = '#desk';
+    }
+    toast('Opened Advisory Desk Workbench.');
+  } else if (item.targetAction === 'nav-knowledge' || item.targetHash === '#knowledge-base') {
+    openKnowledgeBase();
+    toast('Opened Knowledge Base resources.');
+  }
+}
+
+function resetNotifications() {
+  state.notifications = getDefaultNotifications();
+  saveNotifications();
+  updateNotificationsUI();
+  toast('Sample notifications restored.');
+}
+
+function updateNotificationsUI() {
+  const wraps = Array.from(document.querySelectorAll('.notification-menu-wrap'));
+  wraps.forEach(wrap => {
+    const wasOpen = !wrap.querySelector('.notification-menu-dropdown')?.classList.contains('hidden');
+    const temp = document.createElement('div');
+    temp.innerHTML = notificationMenuDropdown();
+    const newWrap = temp.firstElementChild;
+    if (wasOpen && newWrap) {
+      newWrap.querySelector('.notification-menu-dropdown')?.classList.remove('hidden');
+      newWrap.querySelector('.notification-trigger')?.setAttribute('aria-expanded', 'true');
+    }
+    wrap.replaceWith(newWrap);
+  });
+}
+
+function notificationMenuDropdown() {
+  if (!state.user) return '';
+  const notifs = getNotifications();
+  const unreadCount = notifs.filter(n => !n.read).length;
+
+  return `
+    <div class="notification-menu-wrap">
+      <button type="button" class="notification-trigger" data-action="toggle-notifications" aria-haspopup="true" aria-expanded="false" title="Notifications (${unreadCount} unread)">
+        <span class="notification-icon-box">
+          ${icon('bell')}
+          ${unreadCount > 0 ? '<span class="notification-badge-dot"></span>' : ''}
+        </span>
+        <span class="notification-trigger-text">Notifications</span>
+        ${unreadCount > 0 ? `<span class="notification-badge-pill">${unreadCount}</span>` : ''}
+      </button>
+
+      <div class="notification-menu-dropdown hidden" id="notification-menu-dropdown" role="dialog" aria-label="Notifications panel">
+        <div class="notification-header">
+          <div class="notification-header-row">
+            <div class="notification-header-title-box">
+              <strong class="notification-title">Notifications</strong>
+              ${unreadCount > 0 
+                ? `<span class="notification-pill-tag tone-red">${unreadCount} New</span>` 
+                : `<span class="notification-pill-tag tone-neutral">All read</span>`}
+            </div>
+            ${unreadCount > 0 ? `
+              <button type="button" class="notification-action-link-btn" data-action="mark-all-notifications-read" title="Mark all notifications as read">
+                ${icon('check')} Mark all read
+              </button>
+            ` : ''}
+          </div>
+        </div>
+
+        <div class="notification-list" role="region" aria-label="Notifications list">
+          ${notifs.length === 0 ? `
+            <div class="notification-empty">
+              <span class="notification-empty-icon">${icon('bell')}</span>
+              <p><strong>No notifications</strong></p>
+              <span>You are all caught up on engagements and resources.</span>
+            </div>
+          ` : notifs.map(n => `
+            <div class="notification-item ${n.read ? 'read' : 'unread'}" data-action="open-notification" data-notif-id="${e(n.id)}" role="button" tabindex="0">
+              <div class="notification-item-icon-box ${n.tone || 'tone-blue'}">
+                ${icon(n.icon || 'bell')}
+              </div>
+              <div class="notification-item-content">
+                <div class="notification-item-meta">
+                  <span class="notification-cat-tag ${n.tone || 'tone-blue'}">${e(n.category)}</span>
+                  <span class="notification-time">${e(n.time)}</span>
+                  ${!n.read ? `
+                    <button type="button" class="notification-item-check-btn" data-action="mark-notification-read" data-notif-id="${e(n.id)}" title="Mark as read">
+                      ${icon('check')}
+                    </button>
+                  ` : ''}
+                </div>
+                <div class="notification-item-message">${e(n.message)}</div>
+                ${n.targetHash ? `
+                  <div class="notification-item-footer">
+                    <span class="notification-target-hint">
+                      ${n.targetHash === '#desk' ? 'Open Advisory Desk' : 'Open Knowledge Base'} ${icon('arrowRight')}
+                    </span>
+                  </div>
+                ` : ''}
+              </div>
+            </div>
+          `).join('')}
+        </div>
+
+        <div class="notification-footer">
+          <span class="notification-footer-label">Advisory Desk · Notifications</span>
+          <button type="button" class="notification-reset-btn" data-action="reset-notifications" title="Restore sample notifications">Reset</button>
+        </div>
       </div>
     </div>
   `;
@@ -212,12 +494,12 @@ async function boot() {
 function renderAuth() {
   const signup = state.authTab === 'signup';
   const first = state.authStatus.needsSetup;
+  const isDark = state.theme === 'dark';
 
   app.innerHTML = `
-    <main class="auth-page" style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg-canvas);padding:32px 20px;">
-      <div class="auth-form-wrap" style="width:100%;max-width:440px;background:#ffffff;border:1px solid var(--outline);border-radius:var(--radius-xl);padding:36px 32px;box-shadow:var(--shadow-md);">
-        
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;">
+    <main class="auth-page">
+      <section class="auth-card" aria-label="${signup ? 'Create account' : 'Sign in'}">
+        <header class="auth-header">
           <a class="brand" href="#auth">
             <span class="brand-mark">a<span>↗</span></span>
             <div>
@@ -225,39 +507,42 @@ function renderAuth() {
               <span class="alpha">ALPHA</span>
             </div>
           </a>
-          <span class="net-indicator"><i></i> 127.0.0.1</span>
+          <button type="button" class="icon-btn auth-theme-toggle" data-action="toggle-theme" aria-label="${isDark ? 'Switch to light mode' : 'Switch to dark mode'}" title="${isDark ? 'Switch to light mode' : 'Switch to dark mode'}">
+            <span class="theme-icon-indicator">${isDark ? icon('sun') : icon('moon')}</span>
+          </button>
+        </header>
+
+        <div class="auth-title-block">
+          <span class="auth-kicker">${first ? 'Workspace setup' : 'Private advisory workspace'}</span>
+          <h1>${signup ? (first ? 'Initialize workspace' : 'Create account') : 'Welcome back'}</h1>
+          <p>
+          ${signup ? 'Create your account using existing firm credentials or select SSO (Coming Soon).' : 'Sign in to access your assigned client projects and deliverables.'}
+          </p>
         </div>
 
-        <h2 style="font-size:22px;font-weight:800;color:var(--text-primary);margin-bottom:6px;letter-spacing:-0.4px;">
-          ${signup ? (first ? 'Initialize Workspace Super User.' : 'Create your account.') : 'Welcome back to Advisory Desk.'}
-        </h2>
-        <p class="muted" style="font-size:13px;color:var(--text-muted);margin-bottom:22px;">
-          ${signup ? 'Anyone can create an account for open Knowledge Base access. Engagement Managers grant project access.' : 'Sign in to access your assigned client projects and deliverables.'}
-        </p>
-
-        <div class="auth-tabs" style="display:flex;gap:6px;background:var(--bg-surface-variant);padding:4px;border-radius:var(--radius-md);margin-bottom:22px;">
-          <button type="button" data-action="auth-tab" data-tab="login" class="${!signup ? 'active' : ''}" style="flex:1;padding:8px;border-radius:var(--radius-sm);font-size:13px;font-weight:600;color:${!signup ? 'var(--brand-blue)' : 'var(--text-muted)'};background:${!signup ? '#ffffff' : 'transparent'};box-shadow:${!signup ? 'var(--shadow-sm)' : 'none'};">Sign in</button>
-          <button type="button" data-action="auth-tab" data-tab="signup" class="${signup ? 'active' : ''}" style="flex:1;padding:8px;border-radius:var(--radius-sm);font-size:13px;font-weight:600;color:${signup ? 'var(--brand-blue)' : 'var(--text-muted)'};background:${signup ? '#ffffff' : 'transparent'};box-shadow:${signup ? 'var(--shadow-sm)' : 'none'};">Create account</button>
+        <div class="auth-tabs" role="tablist" aria-label="Authentication mode">
+          <button type="button" role="tab" aria-selected="${!signup}" data-action="auth-tab" data-tab="login" class="${!signup ? 'active' : ''}">Sign in</button>
+          <button type="button" role="tab" aria-selected="${signup}" data-action="auth-tab" data-tab="signup" class="${signup ? 'active' : ''}">Create account</button>
         </div>
 
         <form id="auth-form" class="form-stack">
           ${signup ? `
-            <label>Full name
+            <label class="auth-field">Full name
               <input name="name" autocomplete="name" placeholder="Your name (e.g. Alex Morgan)" maxlength="100" required autofocus>
             </label>
           ` : ''}
-          <label>Work email
+          <label class="auth-field">Work email
             <input type="email" name="email" autocomplete="email" placeholder="you@yourfirm.com" required maxlength="254" ${!signup ? 'autofocus' : ''}>
           </label>
-          <label>Password
-            <div class="password-field" style="position:relative;display:flex;align-items:center;">
-              <input type="password" name="password" autocomplete="${signup ? 'new-password' : 'current-password'}" placeholder="${signup ? 'At least 12 characters' : 'Enter your password'}" ${signup ? 'minlength="12"' : ''} maxlength="128" required style="width:100%;padding-right:42px;">
-              <button type="button" class="icon-btn" data-action="toggle-password" aria-label="Show password" style="position:absolute;right:6px;border:none;background:transparent;">${icon('eye')}</button>
+          <label class="auth-field">Password
+            <div class="password-field">
+              <input type="password" name="password" autocomplete="${signup ? 'new-password' : 'current-password'}" placeholder="${signup ? 'At least 12 characters' : 'Enter your password'}" ${signup ? 'minlength="12"' : ''} maxlength="128" required>
+              <button type="button" class="icon-btn" data-action="toggle-password" aria-label="Show password">${icon('eye')}</button>
             </div>
           </label>
           
           ${signup && !first ? `
-            <label>Team invitation code <span class="optional">Optional</span>
+            <label class="auth-field">Team invitation code <span class="optional">Optional</span>
               <input name="invite" autocomplete="off" placeholder="Leave blank for standard access">
             </label>
           ` : ''}
@@ -277,28 +562,112 @@ function renderAuth() {
           ` : ''}
 
           <div class="form-error" role="alert"></div>
-          <button class="btn primary auth-submit" type="submit" style="width:100%;margin-top:8px;">
-            ${signup ? (first ? 'Initialize Workspace' : 'Create Account') : 'Sign In'} ${icon('arrow')}
+          <button class="btn primary auth-submit" type="submit">
+            ${signup ? (first ? 'Initialize workspace' : 'Create account') : 'Sign in'} ${icon('arrow')}
           </button>
         </form>
 
         ${state.authStatus.allowDemo ? `
-          <div class="auth-divider" style="display:flex;align-items:center;gap:14px;margin:22px 0 16px;font-size:12px;color:var(--text-dim);">
-            <div style="flex:1;height:1px;background:var(--outline);"></div>
+          <div class="auth-divider">
             <span>or explore instant demo</span>
-            <div style="flex:1;height:1px;background:var(--outline);"></div>
           </div>
-          ${button('Explore sample workspace ' + icon('arrow'), 'demo', 'btn secondary auth-submit', 'style="width:100%;"')}
-          <p class="demo-note" style="font-size:11.5px;color:var(--text-muted);text-align:center;margin-top:8px;">Pre-seeded with 6 accounting advisory engagements.</p>
+          ${button('Explore sample workspace ' + icon('arrow'), 'demo', 'btn secondary auth-submit')}
+          <p class="demo-note">Pre-seeded with 6 accounting advisory engagements.</p>
         ` : ''}
 
-        <footer style="margin-top:24px;padding-top:16px;border-top:1px solid var(--outline);display:flex;justify-content:space-between;font-size:11px;color:var(--text-dim);">
+        <footer class="auth-footer">
           <span>Local-first · Zero egress</span>
           <span>Advisory Desk v0.1 Alpha</span>
         </footer>
-      </div>
+      </section>
     </main>
   `;
+}
+
+/* ==========================================================================
+   REQUIRED USER PREFERENCES / ONBOARDING
+   ========================================================================== */
+
+function renderPreferences() {
+  const u = state.user;
+  const hasPicture = Boolean(u.profilePicture);
+
+  app.innerHTML = `
+    <main class="preferences-page">
+      <section class="preferences-card">
+        <header class="preferences-header">
+          <a class="brand" href="#preferences">
+            <span class="brand-mark">a<span>↗</span></span>
+            <div>
+              <span>advisory desk</span>
+              <span class="alpha">ALPHA</span>
+            </div>
+          </a>
+          ${button(icon('logout'), 'logout', 'icon-btn', 'aria-label="Sign out" title="Sign out"')}
+        </header>
+
+        <div class="preferences-title">
+          <span class="auth-kicker">${u.profileComplete ? 'User settings' : 'Complete setup'}</span>
+          <h1>User settings and preferences</h1>
+          <p>Confirm your firm profile before opening the workspace.</p>
+        </div>
+
+        <form id="preferences-form" class="preferences-form form-stack">
+          <div class="preferences-grid">
+            <label>Name
+              <input name="name" value="${e(u.name)}" autocomplete="name" required maxlength="100">
+            </label>
+            <label>Email ID
+              <input name="email" value="${e(u.email)}" autocomplete="email" readonly>
+            </label>
+            <label>Password
+              <input value="Configured during account setup" readonly>
+            </label>
+            <label>Employee ID
+              <input name="employeeId" value="${e(u.employeeId)}" autocomplete="off" required maxlength="40" placeholder="Firm employee ID">
+            </label>
+            <label>Designation
+              <select name="designation" required>
+                <option value="">Select designation</option>
+                ${options(designations, u.designation)}
+              </select>
+            </label>
+            <label>Profile picture <span class="optional">Optional</span>
+              <input name="profilePicture" type="file" accept="image/png,image/jpeg,image/webp">
+            </label>
+          </div>
+
+          <div class="profile-picture-preview">
+            <span class="avatar large">${hasPicture ? `<img src="${e(u.profilePicture)}" alt="">` : e(initials(u.name))}</span>
+            <div>
+              <strong>${hasPicture ? 'Profile picture added' : 'No profile picture selected'}</strong>
+              <span>PNG, JPG, or WebP. Maximum 750 KB.</span>
+            </div>
+          </div>
+
+          <section class="usage-policy-box">
+            <div>
+              <h2>Usage policy</h2>
+              <p>Use Advisory Desk only for assigned firm workstreams. Keep client material within approved projects, do not upload unrelated personal data, and follow your firm's confidentiality and review standards.</p>
+            </div>
+            <label class="checkbox-row">
+              <input type="checkbox" name="usagePolicy" value="accepted" ${u.usagePolicyAccepted ? 'checked' : ''} required>
+              <span>I have read and accept the usage policy.</span>
+            </label>
+          </section>
+
+          <div class="form-error" role="alert"></div>
+          <div class="preferences-actions">
+            <button type="submit" class="btn primary" data-preferences-submit disabled>
+              ${u.profileComplete ? 'Save preferences' : 'Read and accept usage policy'} ${icon('check')}
+            </button>
+          </div>
+        </form>
+      </section>
+    </main>
+  `;
+
+  syncPreferencesSubmit(document.querySelector('#preferences-form'));
 }
 
 /* ==========================================================================
@@ -314,13 +683,19 @@ function renderHub() {
   app.innerHTML = `
     <div class="splash-container">
       <header class="splash-topbar">
-        <a class="brand" href="#hub">
-          <span class="brand-mark">a<span>↗</span></span>
-          <div>
-            <span>advisory desk</span>
-            <span class="alpha">ALPHA</span>
-          </div>
-        </a>
+        <div class="splash-topbar-left">
+          <a class="brand" href="#hub">
+            <span class="brand-mark">a<span>↗</span></span>
+            <div>
+              <span>advisory desk</span>
+              <span class="alpha">ALPHA</span>
+            </div>
+          </a>
+          ${state.user ? `
+            <span class="topbar-divider"></span>
+            ${notificationMenuDropdown()}
+          ` : ''}
+        </div>
 
         <div class="splash-top-right">
           <span class="net-indicator"><i></i> 127.0.0.1 Connected</span>
@@ -406,10 +781,128 @@ function renderHub() {
    ========================================================================== */
 
 function shell(content, title = 'Projects', trail = '') {
+  const isProject = Boolean(state.page === 'project' && state.project && state.project.project);
+  const projectData = isProject ? state.project : null;
+  const p = projectData?.project;
+
   const nav = (page, text, symbol, extra = '') => {
     const isActive = (state.page === page) || (page === 'project-setup' && (state.page === 'projects' || state.page === 'project-setup'));
     return `<a href="#${page}" class="nav-link ${isActive ? 'active' : ''}">${icon(symbol)}<span>${text}</span>${extra}</a>`;
   };
+
+  const projectTabNav = (tab, text, symbol, count) => {
+    const isTabActive = (tab === 'setup')
+      ? (state.projectTab === 'setup' || state.projectTab === 'team')
+      : (state.projectTab === tab);
+    return `
+      <button type="button" class="nav-link ${isTabActive ? 'active' : ''}" data-action="project-tab" data-tab="${tab}">
+        ${icon(symbol)}
+        <span>${text}</span>
+        ${count !== undefined && count > 0 ? `<span class="nav-count">${count}</span>` : ''}
+      </button>
+    `;
+  };
+
+  const sidebarSwitch = isProject ? `
+    <div class="workspace-switch project-workspace-switch" title="${e(p.name)}">
+      <span class="workspace-avatar">${e(initials(p.name || p.client))}</span>
+      <div style="min-width:0;overflow:hidden;">
+        <strong style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;">${e(p.name)}</strong>
+        <span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;">${e(p.client)}</span>
+      </div>
+      ${icon('lock')}
+    </div>
+  ` : `
+    <div class="workspace-switch">
+      <span class="workspace-avatar">${e(initials(state.workspace.workspaceName || 'Advisory Team'))}</span>
+      <div>
+        <strong>${e(state.workspace.workspaceName || 'Advisory Team')}</strong>
+        <span>${state.user.demo ? 'Sample workspace' : 'Team workspace'}</span>
+      </div>
+      ${icon('lock')}
+    </div>
+  `;
+
+  const sidebarNav = isProject ? `
+    <div class="nav-label">WORKSPACE</div>
+    <nav aria-label="Project navigation">
+      ${projectTabNav('overview', 'Dashboard', 'dashboard')}
+      ${projectTabNav('resources', 'Project Resources', 'folder', projectData.resources?.length)}
+      ${projectTabNav('deliverables', 'Final Deliverables', 'slides', projectData.deliverables?.length)}
+      ${projectTabNav('setup', 'Engagement Setup', 'hierarchy', projectData.members?.length)}
+    </nav>
+  ` : `
+    <div class="nav-label">WORKSPACE</div>
+    <nav aria-label="Main navigation">
+      ${nav('hub', 'Hub (Home)', 'hub')}
+      ${nav('desk', 'Advisory Desk', 'briefcase')}
+      ${nav('project-setup', 'Engagement Manager', 'hierarchy', `<span class="nav-count">${state.projects.length}</span>`)}
+      <a href="#knowledge-base" class="nav-link ${state.page === 'knowledge-base' ? 'active' : ''}">
+        ${icon('book')}
+        <span>Knowledge Base</span>
+        <span class="coming-soon-badge" style="margin-left:auto;font-size:8.5px;padding:2px 6px;">SOON</span>
+      </a>
+      ${nav('deliverables', 'Deliverables', 'slides')}
+      ${nav('activity', 'Activity', 'clock')}
+    </nav>
+  `;
+
+  const sidebarToolkit = isProject ? `
+    <div class="nav-label tools-label">TOOLKIT</div>
+    <button type="button" class="toolkit-item toolkit-btn" data-action="new-memo" title="Create technical memo">
+      ${icon('file')}<span>Memo Builder</span><span class="toolkit-dot tone-blue"></span>
+    </button>
+    <button type="button" class="toolkit-item toolkit-btn" data-action="new-deck" title="Create slide deck">
+      ${icon('slides')}<span>Slide Decks</span><span class="toolkit-dot tone-red"></span>
+    </button>
+    <div class="toolkit-item muted" title="Financial Statement sanity checks (Coming soon)">
+      ${icon('chart')}<span>FS Helper</span><span class="coming-soon-badge" style="margin-left:auto;font-size:8px;padding:2px 4px;">SOON</span>
+    </div>
+  ` : `
+    <div class="nav-label tools-label">TOOLKIT</div>
+    <button type="button" class="toolkit-item toolkit-btn" data-action="quick-memo" title="Create technical memo">
+      ${icon('file')}<span>Memo Builder</span><span class="toolkit-dot tone-blue"></span>
+    </button>
+    <button type="button" class="toolkit-item toolkit-btn" data-action="quick-deck" title="Create slide deck">
+      ${icon('slides')}<span>Slide Decks</span><span class="toolkit-dot tone-red"></span>
+    </button>
+    <div class="toolkit-item muted" title="Financial Statement sanity checks (Coming soon)">
+      ${icon('chart')}<span>FS Helper</span><span class="coming-soon-badge" style="margin-left:auto;font-size:8px;padding:2px 4px;">SOON</span>
+    </div>
+  `;
+
+  const kbExternalLink = `
+    <a href="#knowledge-base" target="_blank" rel="noopener noreferrer" class="nav-link kb-external-link" data-action="open-knowledge-tab" title="Open Knowledge Base in a new tab">
+      ${icon('book')}
+      <span>Knowledge Base</span>
+      <span class="kb-tab-pill" style="margin-left:auto;display:inline-flex;align-items:center;gap:4px;">
+        <span class="coming-soon-badge" style="font-size:8px;padding:2px 5px;">SOON</span>
+        <span style="font-size:12px;opacity:0.7;font-weight:600;">↗</span>
+      </span>
+    </a>
+  `;
+
+  const sidebarBottom = `
+    <div class="sidebar-bottom">
+      ${isProject ? kbExternalLink : ''}
+      <div class="private-note">
+        ${icon('shield')}
+        <div>
+          <strong>Private & Scoped</strong>
+          <span>Resources belong to their project.</span>
+        </div>
+      </div>
+
+      ${state.user.role === 'super_user' && !state.user.demo && !isProject ? nav('settings', 'Settings', 'settings') : ''}
+
+      <a href="#hub" class="nav-link return-hub-link">
+        ${icon('hub')}
+        <span>Return to Hub</span>
+      </a>
+    </div>
+  `;
+
+  const breadcrumbTarget = isProject ? 'project-setup' : state.page;
 
   app.innerHTML = `
     <div class="app-shell">
@@ -422,70 +915,24 @@ function shell(content, title = 'Projects', trail = '') {
           </div>
         </a>
 
-        <div class="workspace-switch">
-          <span class="workspace-avatar">${e(initials(state.workspace.workspaceName || 'Advisory Team'))}</span>
-          <div>
-            <strong>${e(state.workspace.workspaceName || 'Advisory Team')}</strong>
-            <span>${state.user.demo ? 'Sample workspace' : 'Team workspace'}</span>
-          </div>
-          ${icon('lock')}
-        </div>
-
-        <div class="nav-label">WORKSPACE</div>
-        <nav aria-label="Main navigation">
-          ${nav('hub', 'Hub (Home)', 'hub')}
-          ${nav('desk', 'Advisory Desk', 'briefcase')}
-          ${nav('project-setup', 'Engagement Manager', 'hierarchy', `<span class="nav-count">${state.projects.length}</span>`)}
-          <a href="#knowledge-base" class="nav-link ${state.page === 'knowledge-base' ? 'active' : ''}">
-            ${icon('book')}
-            <span>Knowledge Base</span>
-            <span class="coming-soon-badge" style="margin-left:auto;font-size:8.5px;padding:2px 6px;">SOON</span>
-          </a>
-          ${nav('deliverables', 'Deliverables', 'slides')}
-          ${nav('activity', 'Activity', 'clock')}
-        </nav>
-
-        <div class="nav-label tools-label">TOOLKIT</div>
-        <div class="toolkit-item">
-          ${icon('file')}<span>Technical memos</span><span class="toolkit-dot tone-blue"></span>
-        </div>
-        <div class="toolkit-item">
-          ${icon('slides')}<span>Slide decks</span><span class="toolkit-dot tone-red"></span>
-        </div>
-        <div class="toolkit-item muted">
-          ${icon('chart')}<span>FS sanity checks</span><span class="coming-soon-badge" style="margin-left:auto;font-size:8px;padding:2px 4px;">SOON</span>
-        </div>
-
-        <div class="sidebar-bottom">
-          <div class="private-note">
-            ${icon('shield')}
-            <div>
-              <strong>Private & Scoped</strong>
-              <span>Resources belong to their project.</span>
-            </div>
-          </div>
-
-          ${state.user.role === 'super_user' && !state.user.demo ? nav('settings', 'Settings', 'settings') : ''}
-
-          <div class="profile">
-            <span class="avatar">${e(initials(state.user.name))}</span>
-            <div>
-              <strong>${e(state.user.name)}</strong>
-              <span>${state.user.demo ? 'Demo user' : state.user.role === 'super_user' ? 'Super user' : 'Team member'}</span>
-            </div>
-            ${button(icon('logout'), 'logout', 'icon-btn', 'aria-label="Sign out" title="Sign out"')}
-          </div>
-        </div>
+        ${sidebarSwitch}
+        ${sidebarNav}
+        ${sidebarToolkit}
+        ${sidebarBottom}
       </aside>
 
       <div class="main-wrap">
         <header class="topbar">
-          ${button(icon('menu'), 'mobile-menu', 'icon-btn mobile-menu', 'aria-label="Toggle navigation"')}
-          <div class="breadcrumb">
-            <a href="#hub">Hub</a>
-            ${icon('chevron')}
-            <a href="#${state.page}">${e(title)}</a>
-            ${trail ? icon('chevron') + `<span class="breadcrumb-current">${e(trail)}</span>` : ''}
+          <div class="topbar-left">
+            ${button(icon('menu'), 'mobile-menu', 'icon-btn mobile-menu', 'aria-label="Toggle navigation"')}
+            ${notificationMenuDropdown()}
+            <span class="topbar-divider"></span>
+            <div class="breadcrumb">
+              <a href="#hub">Hub</a>
+              ${icon('chevron')}
+              <a href="#${breadcrumbTarget}">${e(title)}</a>
+              ${trail ? icon('chevron') + `<span class="breadcrumb-current">${e(trail)}</span>` : ''}
+            </div>
           </div>
           <div class="topbar-right">
             <a href="#hub" class="btn secondary small-btn">${icon('hub')} Hub</a>
@@ -528,6 +975,8 @@ function renderDesk() {
             </div>
           </a>
           <span class="topbar-divider"></span>
+          ${notificationMenuDropdown()}
+          <span class="topbar-divider"></span>
           <a href="#hub" class="btn secondary small-btn">
             ${icon('hub')} Hub
           </a>
@@ -550,13 +999,11 @@ function renderDesk() {
             <h1>Workbench<span class="heading-dot">.</span></h1>
             <p>Active advisory engagements you are assigned to. Select an engagement to enter its workstation.</p>
           </div>
-          ${state.projects.length ? `
-            <div class="button-row">
-              <button type="button" class="btn primary" data-action="new-project">
-                ${icon('plus')} Create Engagement
-              </button>
-            </div>
-          ` : ''}
+          <div class="button-row">
+            <button type="button" class="btn primary" data-action="new-project">
+              ${icon('plus')} Create Engagement
+            </button>
+          </div>
         </section>
 
         ${state.projects.length === 0 ? `
@@ -568,9 +1015,6 @@ function renderDesk() {
                 <p>You have no active engagements. Please create one or ask the Engagement Manager to invite you to an active engagement</p>
               </div>
             </div>
-            <button type="button" class="btn primary" data-action="new-project">
-              ${icon('plus')} Create Engagement
-            </button>
           </div>
         ` : `
           <div class="project-grid">
@@ -1002,39 +1446,315 @@ function resourceRows(resources, compact = false) {
   `;
 }
 
+function renderEngagementSetup(isModal = false) {
+  const data = state.project;
+  const p = data.project;
+  const owner = p.owner_id === state.user.id;
+  const currentTab = state.setupTab || 'general';
+
+  const currentType = normalizeEngagementType(p.type);
+  const subTypeList = engagementSubTypes[currentType] || ['General'];
+  const currentSubType = (p.sub_type && subTypeList.includes(p.sub_type)) ? p.sub_type : subTypeList[0];
+  const currentGaap = normalizeFramework(p.gaap);
+
+  let tabBody = '';
+
+  if (currentTab === 'general') {
+    tabBody = `
+      <section class="panel setup-panel">
+        <div class="panel-heading" style="margin-bottom:20px;">
+          <div>
+            <h3 style="font-size:16px;color:var(--text-primary);margin:0;">Project General</h3>
+            <p style="font-size:12.5px;color:var(--text-muted);margin:3px 0 0;">Basic engagement identity, client details, and administrative metadata.</p>
+          </div>
+        </div>
+
+        <form id="project-general-form" class="setup-form">
+          <div class="form-grid">
+            <label>
+              <span>Project Name <strong style="color:var(--brand-red);">*</strong></span>
+              <input type="text" name="name" value="${e(p.name)}" maxlength="120" required ${!owner ? 'disabled' : ''}>
+              <small class="field-hint">Official engagement title.</small>
+            </label>
+
+            <label>
+              <span>Client Name <strong style="color:var(--brand-red);">*</strong></span>
+              <input type="text" name="client" value="${e(p.client)}" maxlength="120" required ${!owner ? 'disabled' : ''}>
+              <small class="field-hint">Client legal entity or confidential alias.</small>
+            </label>
+
+            <label>
+              <span>Project Type <strong style="color:var(--brand-red);">*</strong></span>
+              <select name="projectType" ${!owner ? 'disabled' : ''}>
+                <option value="Live" ${(p.project_type || 'Live') === 'Live' ? 'selected' : ''}>Live</option>
+                <option value="Test" ${p.project_type === 'Test' ? 'selected' : ''}>Test</option>
+              </select>
+              <small class="field-hint">Live client engagement or test scenario.</small>
+            </label>
+
+            <label>
+              <span>Created Date &amp; Time</span>
+              <input type="text" value="${e(formatDateTime(p.created))}" readonly class="readonly-input">
+              <small class="field-hint">Engagement creation timestamp (Read-only).</small>
+            </label>
+
+            <label>
+              <span>Created By</span>
+              <input type="text" value="${e(p.owner_name || state.user?.name || 'Project Owner')}" readonly class="readonly-input">
+              <small class="field-hint">Engagement creator and manager (Read-only).</small>
+            </label>
+          </div>
+
+          ${owner ? `
+            <div class="setup-form-actions">
+              <button type="submit" class="btn primary small-btn">Save Changes</button>
+            </div>
+          ` : ''}
+        </form>
+      </section>
+    `;
+  } else if (currentTab === 'parameters') {
+    tabBody = `
+      <section class="panel setup-panel">
+        <div class="panel-heading" style="margin-bottom:20px;">
+          <div>
+            <h3 style="font-size:16px;color:var(--text-primary);margin:0;">Engagement Parameters</h3>
+            <p style="font-size:12.5px;color:var(--text-muted);margin:3px 0 0;">Technical parameters, accounting framework, and reporting deadlines.</p>
+          </div>
+        </div>
+
+        <form id="engagement-params-form" class="setup-form">
+          <div class="form-grid">
+            <label>
+              <span>Client Name</span>
+              <input type="text" value="${e(p.client)}" readonly class="readonly-input" title="Pulled from Project General">
+              <small class="field-hint">Pulled from Project General (Read-only).</small>
+            </label>
+
+            <label>
+              <span>Client ID</span>
+              <input type="text" name="clientId" value="${e(p.client_id || '')}" placeholder="e.g. CLI-84920 (Optional)" maxlength="50" ${!owner ? 'disabled' : ''}>
+              <small class="field-hint">Optional for now (will become mandatory with CRM integration).</small>
+            </label>
+
+            <label>
+              <span>Engagement ID</span>
+              <input type="text" name="engagementId" value="${e(p.engagement_id || '')}" placeholder="e.g. ENG-2026-001 (Optional)" maxlength="50" ${!owner ? 'disabled' : ''}>
+              <small class="field-hint">Optional internal billing or engagement tracking code.</small>
+            </label>
+
+            <label>
+              <span>Year End Date <strong style="color:var(--brand-red);">*</strong></span>
+              <input type="date" name="fy" value="${e(p.fy ? p.fy.slice(0, 10) : '')}" required ${!owner ? 'disabled' : ''}>
+              <small class="field-hint">Reporting financial year end date.</small>
+            </label>
+
+            <label>
+              <span>Estimated Completion Date</span>
+              <input type="date" name="estimatedCompletion" value="${e(p.estimated_completion ? p.estimated_completion.slice(0, 10) : '')}" ${!owner ? 'disabled' : ''}>
+              <small class="field-hint">Target sign-off or deliverable completion date.</small>
+            </label>
+
+            <label>
+              <span>Engagement Type <strong style="color:var(--brand-red);">*</strong></span>
+              <select name="type" id="engagement-type-select" ${!owner ? 'disabled' : ''}>
+                ${engagementTypes.map(t => `<option value="${e(t)}" ${t === currentType ? 'selected' : ''}>${e(t)}</option>`).join('')}
+              </select>
+              <small class="field-hint">Core advisory engagement service line.</small>
+            </label>
+
+            <label>
+              <span>Engagement Sub-Type <strong style="color:var(--brand-red);">*</strong></span>
+              <select name="subType" id="engagement-sub-type-select" ${!owner ? 'disabled' : ''}>
+                ${subTypeList.map(st => `<option value="${e(st)}" ${st === currentSubType ? 'selected' : ''}>${e(st)}</option>`).join('')}
+              </select>
+              <small class="field-hint">Specialized focus area for this engagement.</small>
+            </label>
+
+            <label>
+              <span>Accounting Framework <strong style="color:var(--brand-red);">*</strong></span>
+              <select name="gaap" ${!owner ? 'disabled' : ''}>
+                ${setupFrameworks.map(f => `<option value="${e(f)}" ${f === currentGaap ? 'selected' : ''}>${e(f)}</option>`).join('')}
+              </select>
+              <small class="field-hint">Primary reporting standard used for technical analysis.</small>
+            </label>
+          </div>
+
+          ${owner ? `
+            <div class="setup-form-actions">
+              <button type="submit" class="btn primary small-btn">Save Parameters</button>
+            </div>
+          ` : ''}
+        </form>
+      </section>
+    `;
+  } else if (currentTab === 'team') {
+    tabBody = `
+      <section class="panel setup-panel">
+        <div class="panel-heading" style="margin-bottom:20px;display:flex;justify-content:space-between;align-items:center;">
+          <div>
+            <h3 style="font-size:16px;color:var(--text-primary);margin:0;">Assigned Engagement Team <span class="count-bubble">${data.members.length}</span></h3>
+            <p style="font-size:12.5px;color:var(--text-muted);margin:3px 0 0;">Manage engagement teammates, designations, and governance roles.</p>
+          </div>
+          ${owner ? button(icon('plus') + ' Add teammate', 'add-member', 'btn primary small-btn') : ''}
+        </div>
+
+        <div class="team-table-wrap">
+          <table class="team-table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Email ID</th>
+                <th>Designation</th>
+                <th>Role</th>
+                ${owner ? '<th style="text-align:right;">Actions</th>' : ''}
+              </tr>
+            </thead>
+            <tbody>
+              ${data.members.map(m => {
+                const isSelf = m.id === state.user.id;
+                const isOwner = m.id === p.owner_id;
+                const currentRole = m.role || (isOwner ? 'Engagement Manager' : 'Team Member');
+                const memberDesignation = m.designation || (isOwner ? 'Manager' : 'Senior Associate');
+                return `
+                  <tr>
+                    <td class="team-member-name-cell">
+                      <div style="display:flex;align-items:center;gap:10px;">
+                        <span class="avatar small">${e(initials(m.name))}</span>
+                        <div>
+                          <strong style="display:block;font-size:13.5px;color:var(--text-primary);">${e(m.name)} ${isSelf ? '<span class="you-pill">(you)</span>' : ''}</strong>
+                        </div>
+                      </div>
+                    </td>
+                    <td class="team-member-email-cell" style="font-family:var(--font-mono);font-size:12.5px;color:var(--text-muted);">${e(m.email)}</td>
+                    <td class="team-member-designation-cell">
+                      <span class="designation-pill">${e(memberDesignation)}</span>
+                    </td>
+                    <td class="team-member-role-cell">
+                      ${owner ? `
+                        <select class="member-role-select" data-member-id="${m.id}" data-action="change-member-role" aria-label="Role for ${e(m.name)}" ${isOwner ? 'disabled title="Project Owner is Engagement Manager"' : ''}>
+                          <option value="Engagement Manager" ${currentRole === 'Engagement Manager' ? 'selected' : ''}>Engagement Manager</option>
+                          <option value="Reviewer" ${currentRole === 'Reviewer' ? 'selected' : ''}>Reviewer</option>
+                          <option value="Team Member" ${currentRole === 'Team Member' ? 'selected' : ''}>Team Member</option>
+                        </select>
+                      ` : `
+                        <span class="role-pill role-${currentRole.toLowerCase().replace(/\s+/g, '-')}">${e(currentRole)}</span>
+                      `}
+                    </td>
+                    ${owner ? `
+                      <td style="text-align:right;">
+                        ${!isOwner ? button(icon('trash'), 'remove-member', 'icon-btn subtle-danger', `data-id="${m.id}" data-name="${e(m.name)}" aria-label="Remove ${e(m.name)}" title="Remove teammate"`) : '<span style="font-size:11.5px;color:var(--text-muted);">Owner</span>'}
+                      </td>
+                    ` : ''}
+                  </tr>
+                `;
+              }).join('')}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    `;
+  }
+
+  return `
+    <div class="engagement-setup-container">
+      <div class="setup-tabs" role="tablist" aria-label="Engagement setup sections">
+        <button type="button" class="setup-tab-btn ${currentTab === 'general' ? 'active' : ''}" role="tab" aria-selected="${currentTab === 'general'}" data-action="setup-tab" data-tab="general">
+          ${icon('folder')}
+          <span>Project General</span>
+        </button>
+        <button type="button" class="setup-tab-btn ${currentTab === 'parameters' ? 'active' : ''}" role="tab" aria-selected="${currentTab === 'parameters'}" data-action="setup-tab" data-tab="parameters">
+          ${icon('chart')}
+          <span>Engagement Parameters</span>
+        </button>
+        <button type="button" class="setup-tab-btn ${currentTab === 'team' ? 'active' : ''}" role="tab" aria-selected="${currentTab === 'team'}" data-action="setup-tab" data-tab="team">
+          ${icon('users')}
+          <span>Team Setup</span>
+          <span class="tab-count-badge">${data.members.length}</span>
+        </button>
+      </div>
+
+      <div class="setup-tab-body">
+        ${tabBody}
+      </div>
+
+      ${isModal ? `
+        <div class="modal-actions" style="margin-top:24px;display:flex;justify-content:flex-end;gap:10px;">
+          ${button('Done', 'complete-engagement-setup', 'btn primary')}
+        </div>
+      ` : ''}
+    </div>
+  `;
+}
+
+function openEngagementSetupModal() {
+  const content = renderEngagementSetup(true);
+  showModal(
+    'Engagement Setup',
+    'Configure project parameters, accounting framework, and engagement team access.',
+    content,
+    'landscape-modal'
+  );
+}
+
 function renderProject() {
   const data = state.project;
   const p = data.project;
   const owner = p.owner_id === state.user.id;
+  const activeTab = (state.projectTab === 'team') ? 'setup' : (state.projectTab || 'overview');
   const tabs = [
-    ['overview', 'Overview'],
-    ['resources', 'Resources', data.resources.length],
-    ['deliverables', 'Deliverables', data.deliverables.length],
-    ['team', 'Team', data.members.length],
+    ['overview', 'Dashboard'],
+    ['resources', 'Project Resources', data.resources.length],
+    ['deliverables', 'Final Deliverables', data.deliverables.length],
+    ['setup', 'Engagement Setup', data.members.length],
     ['activity', 'Activity']
   ];
 
+  const isSetupPending = (
+    !state.user.demo &&
+    localStorage.getItem(`advisory_setup_completed_${p.id}`) !== 'true' &&
+    (
+      localStorage.getItem(`advisory_setup_pending_${p.id}`) === 'true' ||
+      (data.resources.length === 0 && data.deliverables.length === 0 && !p.description)
+    )
+  );
+
+  const setupBanner = (isSetupPending && activeTab === 'overview') ? `
+    <div class="engagement-setup-banner" role="region" aria-label="Engagement setup notice">
+      <div class="setup-banner-left">
+        <span class="setup-banner-icon">${icon('shield')}</span>
+        <div class="setup-banner-content">
+          <strong>Please set up the Engagement before continuing</strong>
+          <span>Configure engagement team access, accounting parameters, and project brief.</span>
+        </div>
+      </div>
+      <div class="setup-banner-actions">
+        ${button('Set up Engagement ' + icon('arrow'), 'open-engagement-setup-modal', 'btn primary small-btn setup-banner-btn')}
+      </div>
+    </div>
+  ` : '';
+
   let content = '';
-  if (state.projectTab === 'overview') {
+  if (activeTab === 'overview') {
     content = `
-      <div class="section-heading" style="margin-bottom:14px;">
+      <div class="section-heading">
         <div>
-          <h2 style="font-size:18px;color:var(--text-primary);">Engagement Workstreams</h2>
-          <p style="font-size:12.5px;color:var(--text-muted);">Select a deliverable to develop.</p>
+          <h2>Engagement Workstreams</h2>
+          <p>Select a deliverable to develop.</p>
         </div>
       </div>
 
       <div class="module-grid">
         <article class="module-card">
           <span class="module-icon tone-blue">${icon('file')}</span>
-          <h3>Technical Memo</h3>
+          <h3>Memo Builder</h3>
           <p>Frame the question, select applicable accounting standards, cite project evidence, and build a working outline.</p>
           ${button('Start a memo ' + icon('arrow'), 'new-memo', 'text-link')}
         </article>
 
         <article class="module-card">
           <span class="module-icon tone-red">${icon('slides')}</span>
-          <h3>Slide Deck</h3>
+          <h3>Slide Decks</h3>
           <p>Bring structure to a proposal, training session, or technical discussion with native PowerPoint export.</p>
           ${button('Start a deck ' + icon('arrow'), 'new-deck', 'text-link')}
         </article>
@@ -1044,7 +1764,7 @@ function renderProject() {
             <span class="module-icon tone-muted" style="margin-bottom:0;">${icon('chart')}</span>
             <span class="coming-soon-badge">Soon</span>
           </div>
-          <h3>FS Sanity Checks</h3>
+          <h3>FS Helper</h3>
           <p>Casting, cross-referencing, and tracing. Future chapter for the advisory workspace.</p>
           <span class="soon-pill">Planned for Phase 2</span>
         </article>
@@ -1077,7 +1797,7 @@ function renderProject() {
             ${data.members.slice(0, 5).map(m => `<span class="avatar" title="${e(m.name)}">${e(initials(m.name))}</span>`).join('')}
             <span>${data.members.length} assigned member${data.members.length === 1 ? '' : 's'}</span>
           </div>
-          ${button('Manage Project Team ' + icon('arrow'), 'project-tab', 'text-link', 'data-tab="team"')}
+          ${button('Engagement Setup & Team ' + icon('arrow'), 'project-tab', 'text-link', 'data-tab="setup"')}
         </section>
       </div>
 
@@ -1089,12 +1809,12 @@ function renderProject() {
         ${resourceRows(data.resources, true)}
       </section>
     `;
-  } else if (state.projectTab === 'resources') {
+  } else if (activeTab === 'resources') {
     content = `
-      <div class="section-heading" style="margin-bottom:14px;display:flex;justify-content:space-between;align-items:center;">
+      <div class="section-heading">
         <div>
-          <h2 style="font-size:18px;color:var(--text-primary);">Project Evidence & Resources</h2>
-          <p style="font-size:12.5px;color:var(--text-muted);">Confidential source documents and memo templates scoped to this project.</p>
+          <h2>Project Resources & Evidence</h2>
+          <p>Confidential source documents and memo templates scoped to this project.</p>
         </div>
         ${button(icon('upload') + ' Upload resource', 'upload-resource', 'btn primary small-btn')}
       </div>
@@ -1103,12 +1823,12 @@ function renderProject() {
         ${icon('lock')} Files are stored in the local SQLite database and strictly scoped to this project. Maximum 10 MB per file.
       </p>
     `;
-  } else if (state.projectTab === 'deliverables') {
+  } else if (activeTab === 'deliverables') {
     content = `
-      <div class="section-heading" style="margin-bottom:14px;display:flex;justify-content:space-between;align-items:center;">
+      <div class="section-heading">
         <div>
-          <h2 style="font-size:18px;color:var(--text-primary);">Engagement Deliverables</h2>
-          <p style="font-size:12.5px;color:var(--text-muted);">Working outlines, reviews, and exported client deliverables.</p>
+          <h2>Final Deliverables</h2>
+          <p>Working outlines, reviews, and exported client deliverables.</p>
         </div>
         <div class="button-row">
           ${button(icon('plus') + ' Memo', 'new-memo', 'btn secondary small-btn')}
@@ -1117,37 +1837,29 @@ function renderProject() {
       </div>
       ${deliveryRows(data.deliverables, p.id)}
     `;
-  } else if (state.projectTab === 'team') {
+  } else if (activeTab === 'setup') {
     content = `
-      <div class="section-heading" style="margin-bottom:14px;display:flex;justify-content:space-between;align-items:center;">
+      <div class="section-heading">
         <div>
-          <h2 style="font-size:18px;color:var(--text-primary);">Assigned Engagement Team</h2>
-          <p style="font-size:12.5px;color:var(--text-muted);">Only these teammates can access this project's resources and deliverables.</p>
+          <h2>Engagement Setup & Governance</h2>
+          <p>Configure project parameters, accounting framework, and engagement team access.</p>
         </div>
-        ${owner ? button(icon('plus') + ' Add teammate', 'add-member', 'btn primary small-btn') : ''}
       </div>
-      <section class="panel">
-        <div class="team-list">
-          ${data.members.map(m => `
-            <div class="team-row">
-              <span class="avatar">${e(initials(m.name))}</span>
-              <div style="flex:1;">
-                <strong>${e(m.name)} ${m.id === state.user.id ? '<span style="color:var(--brand-blue);font-size:11px;">(you)</span>' : ''}</strong>
-                <small>${e(m.email)}</small>
-              </div>
-              <span class="role-tag">${m.id === p.owner_id ? 'Project Owner' : 'Project Member'}</span>
-              ${owner && m.id !== p.owner_id ? button(icon('close'), 'remove-member', 'icon-btn subtle-danger', `data-id="${m.id}" data-name="${e(m.name)}" aria-label="Remove ${e(m.name)}"`) : ''}
-            </div>
-          `).join('')}
-        </div>
-      </section>
+      ${renderEngagementSetup(false)}
     `;
   } else {
-    content = `<section class="panel">${activityList(data.activity)}</section>`;
+    content = `
+      <div class="section-heading">
+        <div>
+          <h2>Project Activity & Audit Trail</h2>
+          <p>Recent project actions and update history.</p>
+        </div>
+      </div>
+      <section class="panel">${activityList(data.activity)}</section>
+    `;
   }
 
   shell(`
-    <a class="back-link" href="#project-setup">${icon('arrow')} Engagement Manager</a>
     <section class="page-heading project-heading">
       <div>
         <h1>${e(p.name)}</h1>
@@ -1165,16 +1877,10 @@ function renderProject() {
       </div>
     </section>
 
-    <div class="project-tabs" role="tablist" aria-label="Project sections">
-      ${tabs.map(([key, label, count]) => `
-        <button class="${state.projectTab === key ? 'active' : ''}" role="tab" aria-selected="${state.projectTab === key}" data-action="project-tab" data-tab="${key}">
-          ${label}${count !== undefined ? `<span>${count}</span>` : ''}
-        </button>
-      `).join('')}
-    </div>
+    ${setupBanner}
 
     <div class="project-tab-content">${content}</div>
-  `, 'Engagement Manager', p.client);
+  `, 'Engagement Manager', p.name);
 }
 
 /* ==========================================================================
@@ -1356,35 +2062,41 @@ function newProject() {
     'Set up client parameters, framework, and financial reporting year end.',
     `
       <form id="new-project-form">
-        <div class="form-stack">
-          <label>Project name
-            <input name="name" placeholder="e.g. Revenue Recognition Assessment" required maxlength="120" autofocus>
-          </label>
-          <div class="form-grid">
+        <div class="landscape-modal-grid">
+          <div class="form-stack">
+            <label>Project name
+              <input name="name" placeholder="e.g. Revenue Recognition Assessment" required maxlength="120" autofocus>
+            </label>
             <label>Client name or confidential alias
               <input name="client" placeholder="e.g. Project Horizon / Acme Corp" required maxlength="120">
             </label>
+            <div class="form-grid">
+              <label>Engagement type
+                <select name="type">${options(types, 'Technical memo')}</select>
+              </label>
+              <label>Accounting framework
+                <select name="gaap">${options(frameworks, 'IFRS')}</select>
+              </label>
+            </div>
             <label>Financial year end
               <input type="date" name="fy" value="2027-03-31" required>
             </label>
-            <label>Engagement type
-              <select name="type">${options(types, 'Technical memo')}</select>
-            </label>
-            <label>Accounting framework
-              <select name="gaap">${options(frameworks, 'IFRS')}</select>
-            </label>
           </div>
-          <label>Scope & context <span class="optional">Optional</span>
-            <textarea name="description" rows="3" placeholder="Transaction background, accounting question, key stakeholder expectations…" maxlength="4000"></textarea>
-          </label>
-          <div class="inline-note">
-            ${icon('lock')}
-            <span>You will be designated as Project Owner. You can invite teammates from the project's Team tab.</span>
+
+          <div class="form-stack">
+            <label style="display:flex;flex-direction:column;flex:1;">Scope & context <span class="optional">Optional</span>
+              <textarea name="description" placeholder="Transaction background, accounting question, key stakeholder expectations…" maxlength="4000" style="min-height:162px;flex:1;resize:vertical;"></textarea>
+            </label>
+            <div class="inline-note">
+              ${icon('lock')}
+              <span>You will be designated as Project Owner. You can invite teammates from the project's Team tab.</span>
+            </div>
           </div>
         </div>
         ${modalActions('Create project setup')}
       </form>
-    `
+    `,
+    'landscape-modal'
   );
 }
 
@@ -1640,6 +2352,13 @@ function addMember() {
           <label>Teammate work email
             <input name="email" type="email" placeholder="teammate@yourfirm.com" required autofocus>
           </label>
+          <label>Role in Engagement
+            <select name="role">
+              <option value="Team Member" selected>Team Member</option>
+              <option value="Reviewer">Reviewer</option>
+              <option value="Engagement Manager">Engagement Manager</option>
+            </select>
+          </label>
           <div class="inline-note">
             ${icon('shield')}
             <span>Teammates can sign up freely on the signup page. Entering their registered email grants access to this project.</span>
@@ -1683,10 +2402,19 @@ async function route() {
   const rawHash = location.hash.slice(1);
   const hash = rawHash || 'hub';
 
+  if (!state.user.demo && !state.user.profileComplete && hash !== 'preferences') {
+    location.hash = '#preferences';
+    renderPreferences();
+    return;
+  }
+
   const projectMatch = /^project\/([\w-]+)$/.exec(hash);
 
   try {
-    if (projectMatch) {
+    if (hash === 'preferences') {
+      state.page = 'preferences';
+      renderPreferences();
+    } else if (projectMatch) {
       state.page = 'project';
       await openProject(projectMatch[1]);
     } else if (hash === 'desk') {
@@ -1725,6 +2453,7 @@ async function route() {
 async function reloadCurrent() {
   await refreshWorkspace();
   if (state.page === 'project') await openProject(state.project.project.id, true);
+  else if (state.page === 'preferences') renderPreferences();
   else if (state.page === 'desk') renderDesk();
   else if (state.page === 'project-setup') renderProjectSetup();
   else if (state.page === 'deliverables') renderDeliverables();
@@ -1742,6 +2471,11 @@ document.addEventListener('click', async event => {
   const action = target.dataset.action;
 
   if (target.tagName === 'A' && target.getAttribute('href')?.startsWith('#')) {
+    if (target.getAttribute('target') === '_blank') {
+      event.preventDefault();
+      window.open(location.origin + location.pathname + target.getAttribute('href'), '_blank', 'noopener,noreferrer');
+      return;
+    }
     event.preventDefault();
     location.hash = target.getAttribute('href');
     return;
@@ -1750,7 +2484,10 @@ document.addEventListener('click', async event => {
   if (state.busy && !['toggle-password', 'close-modal'].includes(action)) return;
 
   try {
-    if (action === 'nav-desk') {
+    if (action === 'open-knowledge-tab') {
+      window.open(location.origin + location.pathname + '#knowledge-base', '_blank', 'noopener,noreferrer');
+      return;
+    } else if (action === 'nav-desk') {
       location.hash = '#desk';
     } else if (action === 'nav-knowledge') {
       openKnowledgeBase();
@@ -1760,13 +2497,32 @@ document.addEventListener('click', async event => {
       const dropdown = target.closest('.user-menu-wrap')?.querySelector('.user-menu-dropdown');
       if (dropdown) {
         const isHidden = dropdown.classList.contains('hidden');
-        document.querySelectorAll('.user-menu-dropdown').forEach(d => d.classList.add('hidden'));
-        document.querySelectorAll('.user-menu-trigger').forEach(b => b.setAttribute('aria-expanded', 'false'));
+        document.querySelectorAll('.user-menu-dropdown, .notification-menu-dropdown').forEach(d => d.classList.add('hidden'));
+        document.querySelectorAll('.user-menu-trigger, .notification-trigger').forEach(b => b.setAttribute('aria-expanded', 'false'));
         if (isHidden) {
           dropdown.classList.remove('hidden');
           target.closest('.user-menu-trigger')?.setAttribute('aria-expanded', 'true');
         }
       }
+    } else if (action === 'toggle-notifications') {
+      const dropdown = target.closest('.notification-menu-wrap')?.querySelector('.notification-menu-dropdown');
+      if (dropdown) {
+        const isHidden = dropdown.classList.contains('hidden');
+        document.querySelectorAll('.user-menu-dropdown, .notification-menu-dropdown').forEach(d => d.classList.add('hidden'));
+        document.querySelectorAll('.user-menu-trigger, .notification-trigger').forEach(b => b.setAttribute('aria-expanded', 'false'));
+        if (isHidden) {
+          dropdown.classList.remove('hidden');
+          target.closest('.notification-trigger')?.setAttribute('aria-expanded', 'true');
+        }
+      }
+    } else if (action === 'mark-all-notifications-read') {
+      markAllNotificationsAsRead();
+    } else if (action === 'mark-notification-read') {
+      markNotificationAsRead(target.dataset.notifId);
+    } else if (action === 'open-notification') {
+      openNotification(target.dataset.notifId);
+    } else if (action === 'reset-notifications') {
+      resetNotifications();
     } else if (action === 'toggle-theme') {
       toggleTheme();
     } else if (action === 'auth-tab') {
@@ -1787,6 +2543,7 @@ document.addEventListener('click', async event => {
     } else if (action === 'logout' || action === 'leave-demo') {
       await send('/auth/logout', {});
       state.user = null;
+      state.notifications = null;
       state.csrf = '';
       state.query = '';
       state.type = 'All types';
@@ -1840,6 +2597,31 @@ document.addEventListener('click', async event => {
         state.project = await api(`/projects/${state.projects[0].id}`);
         newDeck();
       }
+    } else if (action === 'setup-tab') {
+      state.setupTab = target.dataset.tab;
+      const modalDialog = modalRoot.querySelector('dialog');
+      if (modalDialog && modalDialog.open) {
+        const container = modalDialog.querySelector('.engagement-setup-container');
+        if (container) {
+          container.outerHTML = renderEngagementSetup(true);
+        } else {
+          openEngagementSetupModal();
+        }
+      } else {
+        renderProject();
+      }
+    } else if (action === 'open-engagement-setup-modal') {
+      openEngagementSetupModal();
+    } else if (action === 'complete-engagement-setup') {
+      if (state.project?.project?.id) {
+        try {
+          localStorage.removeItem(`advisory_setup_pending_${state.project.project.id}`);
+          localStorage.setItem(`advisory_setup_completed_${state.project.project.id}`, 'true');
+        } catch {}
+      }
+      closeModal();
+      renderProject();
+      toast('Engagement setup saved.');
     } else if (action === 'edit-delivery') {
       await editDelivery(target.dataset.project, target.dataset.id);
     } else if (action === 'add-member') {
@@ -1915,10 +2697,43 @@ document.addEventListener('change', async event => {
       await send(`/projects/${state.project.project.id}`, { status: target.value }, 'PATCH');
       await reloadCurrent();
       toast('Project lifecycle status updated.');
+    } else if (target.id === 'engagement-type-select' || target.name === 'type') {
+      const form = target.closest('form');
+      const subSelect = form?.querySelector('[name="subType"]');
+      if (subSelect) {
+        const subList = engagementSubTypes[target.value] || ['General'];
+        subSelect.innerHTML = subList.map(s => `<option value="${e(s)}">${e(s)}</option>`).join('');
+      }
+    } else if (target.dataset.action === 'change-member-role') {
+      const memberId = target.dataset.memberId;
+      const role = target.value;
+      await send(`/projects/${state.project.project.id}/members/${memberId}`, { role }, 'PATCH');
+      const m = state.project.members.find(x => x.id === memberId);
+      if (m) m.role = role;
+      toast(`Updated team member role to ${role}.`);
     }
   } catch (error) {
     report(error);
   }
+});
+
+document.addEventListener('input', event => {
+  const form = event.target.closest?.('#preferences-form');
+  if (form) syncPreferencesSubmit(form);
+});
+
+document.addEventListener('change', event => {
+  const form = event.target.closest?.('#preferences-form');
+  if (!form) return;
+  if (event.target.name === 'profilePicture') {
+    const file = event.target.files?.[0];
+    const preview = form.querySelector('.profile-picture-preview');
+    if (file && preview) {
+      preview.querySelector('strong').textContent = file.name;
+      preview.querySelector('span:last-child').textContent = 'Selected profile picture. It will be saved after policy acceptance.';
+    }
+  }
+  syncPreferencesSubmit(form);
 });
 
 async function fileBase64(file) {
@@ -1928,6 +2743,13 @@ async function fileBase64(file) {
     reader.onerror = () => reject(new Error('Cannot read file data.'));
     reader.readAsDataURL(file);
   });
+}
+
+function syncPreferencesSubmit(form) {
+  if (!form) return;
+  const submit = form.querySelector('[data-preferences-submit]');
+  if (!submit) return;
+  submit.disabled = !form.checkValidity();
 }
 
 document.addEventListener('submit', async event => {
@@ -1957,12 +2779,37 @@ document.addEventListener('submit', async event => {
     if (form.id === 'auth-form') {
       setSession(await send(`/auth/${state.authTab}`, values));
       state.busy = false;
+      if (state.authTab === 'signup' || (!state.user.demo && !state.user.profileComplete)) {
+        location.hash = '#preferences';
+        renderPreferences();
+        toast(state.authTab === 'signup' ? 'Account created. Complete your preferences to continue.' : 'Complete your preferences to continue.');
+      } else {
+        await refreshWorkspace();
+        location.hash = '#hub';
+        renderHub();
+        toast('Signed in successfully.');
+      }
+    } else if (form.id === 'preferences-form') {
+      const file = data.get('profilePicture');
+      if (file?.size > 750 * 1024) throw new Error('Profile picture must be 750 KB or smaller.');
+      const result = await send('/me/preferences', {
+        name: values.name,
+        employeeId: values.employeeId,
+        designation: values.designation,
+        acceptUsagePolicy: data.get('usagePolicy') === 'accepted',
+        ...(file?.size ? { profilePicture: `data:${file.type};base64,${await fileBase64(file)}` } : {})
+      }, 'PATCH');
+      state.user = result.user;
+      state.busy = false;
       await refreshWorkspace();
       location.hash = '#hub';
       renderHub();
-      toast('Signed in successfully.');
+      toast('Preferences saved. Welcome to your workspace.');
     } else if (form.id === 'new-project-form') {
       const result = await send('/projects', values);
+      try {
+        localStorage.setItem(`advisory_setup_pending_${result.project.id}`, 'true');
+      } catch {}
       finishModal();
       await refreshWorkspace();
       location.hash = `#project/${result.project.id}`;
@@ -2001,9 +2848,50 @@ document.addEventListener('submit', async event => {
       state.busy = false;
       await reloadCurrent();
       toast('Draft saved. Export files updated.');
+    } else if (form.id === 'project-general-form') {
+      await send(`/projects/${state.project.project.id}`, {
+        name: values.name,
+        client: values.client,
+        projectType: values.projectType
+      }, 'PATCH');
+      state.project.project.name = values.name;
+      state.project.project.client = values.client;
+      state.project.project.project_type = values.projectType;
+      state.busy = false;
+      await reloadCurrent();
+      if (modalRoot.querySelector('dialog')?.open) {
+        const wrap = modalRoot.querySelector('.engagement-setup-container');
+        if (wrap) wrap.outerHTML = renderEngagementSetup(true);
+      }
+      toast('Project General settings updated.');
+    } else if (form.id === 'engagement-params-form') {
+      await send(`/projects/${state.project.project.id}`, {
+        clientId: values.clientId,
+        engagementId: values.engagementId,
+        fy: values.fy,
+        estimatedCompletion: values.estimatedCompletion,
+        type: values.type,
+        subType: values.subType,
+        gaap: values.gaap
+      }, 'PATCH');
+      state.project.project.client_id = values.clientId;
+      state.project.project.engagement_id = values.engagementId;
+      state.project.project.fy = values.fy;
+      state.project.project.estimated_completion = values.estimatedCompletion;
+      state.project.project.type = values.type;
+      state.project.project.sub_type = values.subType;
+      state.project.project.gaap = values.gaap;
+      state.busy = false;
+      await reloadCurrent();
+      if (modalRoot.querySelector('dialog')?.open) {
+        const wrap = modalRoot.querySelector('.engagement-setup-container');
+        if (wrap) wrap.outerHTML = renderEngagementSetup(true);
+      }
+      toast('Engagement Parameters updated.');
     } else if (form.id === 'add-member-form') {
       await send(`/projects/${state.project.project.id}/members`, values);
       finishModal();
+      state.setupTab = 'team';
       await reloadCurrent();
       toast('Teammate granted access to project.');
     } else if (form.id === 'delete-resource-form') {
@@ -2059,10 +2947,23 @@ document.addEventListener('click', event => {
     document.querySelectorAll('.user-menu-dropdown').forEach(d => d.classList.add('hidden'));
     document.querySelectorAll('.user-menu-trigger').forEach(b => b.setAttribute('aria-expanded', 'false'));
   }
+  if (!event.target.closest('.notification-menu-wrap')) {
+    document.querySelectorAll('.notification-menu-dropdown').forEach(d => d.classList.add('hidden'));
+    document.querySelectorAll('.notification-trigger').forEach(b => b.setAttribute('aria-expanded', 'false'));
+  }
+});
+
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape') {
+    document.querySelectorAll('.user-menu-dropdown, .notification-menu-dropdown').forEach(d => d.classList.add('hidden'));
+    document.querySelectorAll('.user-menu-trigger, .notification-trigger').forEach(b => b.setAttribute('aria-expanded', 'false'));
+  }
 });
 
 window.addEventListener('hashchange', () => {
   if (modalRoot.querySelector('dialog')) closeModal();
+  document.querySelectorAll('.user-menu-dropdown, .notification-menu-dropdown').forEach(d => d.classList.add('hidden'));
+  document.querySelectorAll('.user-menu-trigger, .notification-trigger').forEach(b => b.setAttribute('aria-expanded', 'false'));
   route();
 });
 

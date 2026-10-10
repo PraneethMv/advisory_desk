@@ -12,7 +12,19 @@ const ROOT = dirname(fileURLToPath(import.meta.url));
 const deriveKey = promisify(scrypt);
 const hash = value => createHash('sha256').update(value).digest('hex');
 const now = () => new Date().toISOString();
-const safeUser = u => ({ id: u.id, name: u.name, email: u.email, role: u.role, demo: Boolean(u.demo) });
+const DESIGNATIONS = ['Intern', 'Associate', 'Senior Associate', 'Assistant Manager', 'Manager', 'Associate Director', 'Director'];
+const safeUser = u => ({
+  id: u.id,
+  name: u.name,
+  email: u.email,
+  role: u.role,
+  demo: Boolean(u.demo),
+  employeeId: u.employee_id || '',
+  designation: u.designation || '',
+  profilePicture: u.profile_picture || '',
+  profileComplete: Boolean(u.demo || u.profile_completed_at),
+  usagePolicyAccepted: Boolean(u.demo || u.usage_policy_accepted_at)
+});
 const PROJECT_TYPES = ['Technical memo', 'GAAP transition', 'IPO advisory', 'Accounting advisory', 'Staff augmentation', 'Training'];
 const DEFAULT_SETTINGS = { workspaceName: 'Advisory team', memoTemplateName: 'Technical accounting memorandum', memoHeadings: 'Purpose and scope\nBackground and facts\nAccounting questions\nApplicable guidance\nAnalysis\nConclusion\nProject evidence\nReview checklist' };
 class ApiError extends Error { constructor(status, message) { super(message); this.status = status; } }
@@ -33,6 +45,16 @@ function dateField(value) {
   const date = textField(value, 'Financial year end', 10);
   requireValue(/^\d{4}-\d{2}-\d{2}$/.test(date) && !Number.isNaN(Date.parse(date)) && new Date(date).toISOString().slice(0, 10) === date, 'Enter a valid financial year end.');
   return date;
+}
+function profilePictureField(value) {
+  if (value == null || value === '') return '';
+  requireValue(typeof value === 'string', 'Profile picture must be an image.');
+  const match = /^data:image\/(png|jpeg|jpg|webp);base64,([A-Za-z0-9+/]*={0,2})$/.exec(value);
+  requireValue(match && match[2].length % 4 === 0, 'Upload a PNG, JPG, or WebP profile picture.');
+  const bytes = Buffer.from(match[2], 'base64');
+  requireValue(bytes.length > 0 && bytes.length <= 750 * 1024, 'Profile picture must be 750 KB or smaller.');
+  const mime = match[1] === 'jpg' ? 'jpeg' : match[1];
+  return `data:image/${mime};base64,${match[2]}`;
 }
 async function passwordHash(password) {
   requireValue(typeof password === 'string' && password.length >= 12 && password.length <= 128, 'Use a password of 12–128 characters.');
@@ -55,11 +77,11 @@ export async function createApp(options = {}) {
     PRAGMA journal_mode = WAL;
     PRAGMA foreign_keys = ON;
     PRAGMA busy_timeout = 5000;
-    CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password TEXT NOT NULL, role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, demo INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password TEXT NOT NULL, role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, demo INTEGER NOT NULL DEFAULT 0, employee_id TEXT NOT NULL DEFAULT '', designation TEXT NOT NULL DEFAULT '', profile_picture TEXT NOT NULL DEFAULT '', usage_policy_accepted_at TEXT, profile_completed_at TEXT, created TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id TEXT REFERENCES users(id) ON DELETE CASCADE, csrf TEXT NOT NULL, expires INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS invitations (id TEXT PRIMARY KEY, email TEXT NOT NULL, token TEXT UNIQUE NOT NULL, expires INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, client TEXT NOT NULL, fy TEXT NOT NULL, type TEXT NOT NULL, gaap TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'Active', owner_id TEXT REFERENCES users(id), created TEXT NOT NULL, updated TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS memberships (project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, user_id TEXT REFERENCES users(id) ON DELETE CASCADE, PRIMARY KEY(project_id,user_id));
+    CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, client TEXT NOT NULL, fy TEXT NOT NULL, type TEXT NOT NULL, gaap TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'Active', owner_id TEXT REFERENCES users(id), created TEXT NOT NULL, updated TEXT NOT NULL, project_type TEXT NOT NULL DEFAULT 'Live', client_id TEXT NOT NULL DEFAULT '', engagement_id TEXT NOT NULL DEFAULT '', estimated_completion TEXT NOT NULL DEFAULT '', sub_type TEXT NOT NULL DEFAULT '');
+    CREATE TABLE IF NOT EXISTS memberships (project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, user_id TEXT REFERENCES users(id) ON DELETE CASCADE, role TEXT NOT NULL DEFAULT 'Team Member', PRIMARY KEY(project_id,user_id));
     CREATE TABLE IF NOT EXISTS resources (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, name TEXT NOT NULL, kind TEXT NOT NULL, size INTEGER NOT NULL, content BLOB NOT NULL, text TEXT NOT NULL DEFAULT '', created_by TEXT REFERENCES users(id), created TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS deliverables (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, kind TEXT NOT NULL, title TEXT NOT NULL, params TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Draft', created_by TEXT REFERENCES users(id), created TEXT NOT NULL, updated TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS activity (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, user_id TEXT REFERENCES users(id), action TEXT NOT NULL, created TEXT NOT NULL);
@@ -69,6 +91,47 @@ export async function createApp(options = {}) {
     CREATE INDEX IF NOT EXISTS deliverables_project ON deliverables(project_id);
     CREATE INDEX IF NOT EXISTS activity_project ON activity(project_id);
   `);
+  const userColumns = new Set(db.prepare('PRAGMA table_info(users)').all().map(column => column.name));
+  const addedProfileColumns = [];
+  const ensureUserColumn = (name, definition) => {
+    if (!userColumns.has(name)) {
+      db.exec(`ALTER TABLE users ADD COLUMN ${name} ${definition}`);
+      userColumns.add(name);
+      addedProfileColumns.push(name);
+    }
+  };
+  ensureUserColumn('employee_id', "TEXT NOT NULL DEFAULT ''");
+  ensureUserColumn('designation', "TEXT NOT NULL DEFAULT ''");
+  ensureUserColumn('profile_picture', "TEXT NOT NULL DEFAULT ''");
+  ensureUserColumn('usage_policy_accepted_at', 'TEXT');
+  ensureUserColumn('profile_completed_at', 'TEXT');
+  if (addedProfileColumns.length) {
+    db.prepare('UPDATE users SET usage_policy_accepted_at=COALESCE(usage_policy_accepted_at, created), profile_completed_at=COALESCE(profile_completed_at, created) WHERE demo=0').run();
+  }
+
+  const projectColumns = new Set(db.prepare('PRAGMA table_info(projects)').all().map(column => column.name));
+  const ensureProjectColumn = (name, definition) => {
+    if (!projectColumns.has(name)) {
+      db.exec(`ALTER TABLE projects ADD COLUMN ${name} ${definition}`);
+      projectColumns.add(name);
+    }
+  };
+  ensureProjectColumn('project_type', "TEXT NOT NULL DEFAULT 'Live'");
+  ensureProjectColumn('client_id', "TEXT NOT NULL DEFAULT ''");
+  ensureProjectColumn('engagement_id', "TEXT NOT NULL DEFAULT ''");
+  ensureProjectColumn('estimated_completion', "TEXT NOT NULL DEFAULT ''");
+  ensureProjectColumn('sub_type', "TEXT NOT NULL DEFAULT ''");
+
+  const membershipColumns = new Set(db.prepare('PRAGMA table_info(memberships)').all().map(column => column.name));
+  const ensureMembershipColumn = (name, definition) => {
+    if (!membershipColumns.has(name)) {
+      db.exec(`ALTER TABLE memberships ADD COLUMN ${name} ${definition}`);
+      membershipColumns.add(name);
+    }
+  };
+  ensureMembershipColumn('role', "TEXT NOT NULL DEFAULT 'Team Member'");
+  db.prepare("UPDATE memberships SET role='Engagement Manager' WHERE user_id IN (SELECT owner_id FROM projects WHERE id=memberships.project_id) AND (role='Team Member' OR role IS NULL OR role='')").run();
+
   db.prepare('INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)').run('workspace', JSON.stringify(DEFAULT_SETTINGS));
   const getSettings = () => JSON.parse(db.prepare('SELECT value FROM settings WHERE key=?').get('workspace').value);
   const transaction = fn => {
@@ -77,7 +140,7 @@ export async function createApp(options = {}) {
   };
   const activity = (project, user, action) => db.prepare('INSERT INTO activity VALUES (?,?,?,?,?)').run(randomUUID(), project, user, action, now());
   const getProject = (id, user) => {
-    const project = db.prepare('SELECT p.* FROM projects p JOIN memberships m ON m.project_id=p.id WHERE p.id=? AND m.user_id=?').get(id, user.id);
+    const project = db.prepare('SELECT p.*, u.name AS owner_name FROM projects p JOIN memberships m ON m.project_id=p.id LEFT JOIN users u ON u.id=p.owner_id WHERE p.id=? AND m.user_id=?').get(id, user.id);
     requireValue(project, 'Project not found or access unavailable.', 404);
     return project;
   };
@@ -132,10 +195,17 @@ export async function createApp(options = {}) {
   }
   function createProject(user, values) {
     const project = { id: randomUUID(), name: textField(values.name, 'Project name', 120), client: textField(values.client, 'Client name or alias', 120), fy: dateField(values.fy), type: textField(values.type, 'Project type'), gaap: textField(values.gaap, 'Accounting framework'), description: textField(values.description, 'Description', 4000, false), owner_id: user.id, created: now() };
-    requireValue(PROJECT_TYPES.includes(project.type), 'Choose a valid project type.');
-    requireValue(Object.keys(STANDARD_CATALOG).includes(project.gaap), 'Choose a valid accounting framework.');
-    db.prepare('INSERT INTO projects (id,name,client,fy,type,gaap,description,owner_id,created,updated) VALUES (?,?,?,?,?,?,?,?,?,?)').run(project.id, project.name, project.client, project.fy, project.type, project.gaap, project.description, user.id, project.created, project.created);
-    db.prepare('INSERT INTO memberships VALUES (?,?)').run(project.id, user.id);
+    const projectType = values.projectType && ['Live', 'Test'].includes(values.projectType) ? values.projectType : 'Live';
+    const clientId = textField(values.clientId, 'Client ID', 50, false);
+    const engagementId = textField(values.engagementId, 'Engagement ID', 50, false);
+    const estimatedCompletion = values.estimatedCompletion ? textField(values.estimatedCompletion, 'Estimated completion', 20, false) : '';
+    const subType = textField(values.subType, 'Sub-type', 100, false);
+    const allowedTypes = [...PROJECT_TYPES, 'Accounting Advisory', 'IPO Advisory', 'Loan Staffing', 'Training'];
+    requireValue(allowedTypes.includes(project.type), 'Choose a valid project type.');
+    const allowedFrameworks = [...Object.keys(STANDARD_CATALOG), 'Ind AS', 'IFRS', 'IGAAP', 'USGAAP', 'Others', 'US GAAP', 'Other'];
+    requireValue(allowedFrameworks.includes(project.gaap), 'Choose a valid accounting framework.');
+    db.prepare('INSERT INTO projects (id,name,client,fy,type,gaap,description,owner_id,created,updated,project_type,client_id,engagement_id,estimated_completion,sub_type) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(project.id, project.name, project.client, project.fy, project.type, project.gaap, project.description, user.id, project.created, project.created, projectType, clientId, engagementId, estimatedCompletion, subType);
+    db.prepare('INSERT INTO memberships (project_id, user_id, role) VALUES (?,?,?)').run(project.id, user.id, 'Engagement Manager');
     activity(project.id, user.id, 'Created the project');
     return project;
   }
@@ -224,10 +294,29 @@ export async function createApp(options = {}) {
       const user = session(req);
       if (!['GET', 'HEAD'].includes(method)) requireValue(req.headers['x-csrf-token'] === user.csrf, 'Your security token is invalid. Refresh and try again.', 403);
       if (path === '/api/me' && method === 'GET') { respond(res, 200, { user: safeUser(user), csrf: user.csrf, workspace: getSettings(), standards: STANDARD_CATALOG }); return; }
+      if (path === '/api/me/preferences' && method === 'PATCH') {
+        requireValue(!user.demo, 'Sample users do not need onboarding preferences.', 403);
+        const input = await payload(req);
+        const name = textField(input.name, 'Full name', 100);
+        const employeeId = textField(input.employeeId, 'Employee ID', 40);
+        const designation = textField(input.designation, 'Designation', 40);
+        requireValue(DESIGNATIONS.includes(designation), 'Choose a valid designation.');
+        requireValue(input.acceptUsagePolicy === true, 'Read and accept the usage policy to continue.');
+        const picture = profilePictureField(input.profilePicture);
+        const accepted = now();
+        db.prepare(`
+          UPDATE users
+          SET name=?, employee_id=?, designation=?, profile_picture=COALESCE(NULLIF(?, ''), profile_picture), usage_policy_accepted_at=COALESCE(usage_policy_accepted_at, ?), profile_completed_at=?
+          WHERE id=?
+        `).run(name, employeeId, designation, picture, accepted, accepted, user.id);
+        const updated = db.prepare('SELECT * FROM users WHERE id=?').get(user.id);
+        respond(res, 200, { user: safeUser(updated) }); return;
+      }
       if (path === '/api/auth/logout' && method === 'POST') {
         db.prepare('DELETE FROM sessions WHERE csrf=? AND user_id=?').run(user.csrf, user.id);
         respond(res, 200, { ok: true }, { 'Set-Cookie': `advisory_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secureCookie ? '; Secure' : ''}` }); return;
       }
+      requireValue(user.demo || user.profile_completed_at, 'Complete user settings and accept the usage policy to continue.', 403);
       if (path === '/api/projects' && method === 'GET') {
         const projects = db.prepare(`SELECT p.*, (SELECT COUNT(*) FROM resources r WHERE r.project_id=p.id) AS resource_count, (SELECT COUNT(*) FROM deliverables d WHERE d.project_id=p.id) AS deliverable_count, (SELECT COUNT(*) FROM memberships mm WHERE mm.project_id=p.id) AS member_count, u.name AS owner_name FROM projects p JOIN memberships m ON m.project_id=p.id JOIN users u ON u.id=p.owner_id WHERE m.user_id=? ORDER BY p.updated DESC`).all(user.id);
         respond(res, 200, { projects }); return;
@@ -271,20 +360,129 @@ export async function createApp(options = {}) {
       if (match) {
         const project = getProject(match[1], user); const suffix = match[2] || '';
         if (!suffix && method === 'GET') {
-          respond(res, 200, { project, resources: db.prepare('SELECT id,name,kind,size,created,created_by FROM resources WHERE project_id=? ORDER BY created DESC').all(project.id), deliverables: db.prepare('SELECT id,kind,title,status,created,updated FROM deliverables WHERE project_id=? ORDER BY updated DESC').all(project.id), members: db.prepare('SELECT u.id,u.name,u.email FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.project_id=?').all(project.id), activity: db.prepare('SELECT a.*,u.name AS user_name FROM activity a JOIN users u ON u.id=a.user_id WHERE project_id=? ORDER BY created DESC LIMIT 40').all(project.id) }); return;
+          respond(res, 200, {
+            project,
+            resources: db.prepare('SELECT id,name,kind,size,created,created_by FROM resources WHERE project_id=? ORDER BY created DESC').all(project.id),
+            deliverables: db.prepare('SELECT id,kind,title,status,created,updated FROM deliverables WHERE project_id=? ORDER BY updated DESC').all(project.id),
+            members: db.prepare("SELECT u.id,u.name,u.email,u.designation,m.role FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.project_id=? ORDER BY CASE WHEN m.role='Engagement Manager' THEN 1 WHEN m.role='Reviewer' THEN 2 ELSE 3 END, u.name ASC").all(project.id),
+            activity: db.prepare('SELECT a.*,u.name AS user_name FROM activity a JOIN users u ON u.id=a.user_id WHERE project_id=? ORDER BY created DESC LIMIT 40').all(project.id)
+          });
+          return;
         }
         if (!suffix && method === 'PATCH') {
-          ownerOnly(project, user); const input = await payload(req); requireValue(['Active', 'On hold', 'Completed'].includes(input.status), 'Choose a valid project status.');
-          transaction(() => { db.prepare('UPDATE projects SET status=?,updated=? WHERE id=?').run(input.status, now(), project.id); activity(project.id, user.id, `Changed project status to ${input.status}`); }); respond(res, 200, { ok: true }); return;
+          ownerOnly(project, user);
+          const input = await payload(req);
+          const updates = [];
+          const params = [];
+          let logMsg = '';
+
+          if (input.status !== undefined) {
+            requireValue(['Active', 'On hold', 'Completed'].includes(input.status), 'Choose a valid project status.');
+            updates.push('status = ?');
+            params.push(input.status);
+            logMsg = `Changed project status to ${input.status}`;
+          }
+          if (input.name !== undefined) {
+            const name = textField(input.name, 'Project name', 120);
+            updates.push('name = ?');
+            params.push(name);
+          }
+          if (input.client !== undefined) {
+            const client = textField(input.client, 'Client name', 120);
+            updates.push('client = ?');
+            params.push(client);
+          }
+          if (input.projectType !== undefined) {
+            requireValue(['Live', 'Test'].includes(input.projectType), 'Choose a valid project type.');
+            updates.push('project_type = ?');
+            params.push(input.projectType);
+          }
+          if (input.clientId !== undefined) {
+            const clientId = textField(input.clientId, 'Client ID', 50, false);
+            updates.push('client_id = ?');
+            params.push(clientId);
+          }
+          if (input.engagementId !== undefined) {
+            const engagementId = textField(input.engagementId, 'Engagement ID', 50, false);
+            updates.push('engagement_id = ?');
+            params.push(engagementId);
+          }
+          if (input.fy !== undefined) {
+            const fy = dateField(input.fy);
+            updates.push('fy = ?');
+            params.push(fy);
+          }
+          if (input.estimatedCompletion !== undefined) {
+            const est = textField(input.estimatedCompletion, 'Estimated completion date', 20, false);
+            if (est) {
+              requireValue(/^\d{4}-\d{2}-\d{2}$/.test(est) && !Number.isNaN(Date.parse(est)), 'Enter a valid estimated completion date.');
+            }
+            updates.push('estimated_completion = ?');
+            params.push(est);
+          }
+          if (input.type !== undefined) {
+            const type = textField(input.type, 'Engagement type', 100);
+            updates.push('type = ?');
+            params.push(type);
+          }
+          if (input.subType !== undefined) {
+            const subType = textField(input.subType, 'Engagement sub-type', 100, false);
+            updates.push('sub_type = ?');
+            params.push(subType);
+          }
+          if (input.gaap !== undefined) {
+            const gaap = textField(input.gaap, 'Accounting framework', 100);
+            updates.push('gaap = ?');
+            params.push(gaap);
+          }
+          if (input.description !== undefined) {
+            const description = textField(input.description, 'Description', 4000, false);
+            updates.push('description = ?');
+            params.push(description);
+          }
+
+          requireValue(updates.length > 0, 'No updates provided.');
+          updates.push('updated = ?');
+          params.push(now());
+          params.push(project.id);
+
+          transaction(() => {
+            db.prepare(`UPDATE projects SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+            activity(project.id, user.id, logMsg || 'Updated engagement setup & parameters');
+          });
+          respond(res, 200, { ok: true });
+          return;
         }
         if (suffix === 'members' && method === 'POST') {
-          ownerOnly(project, user); const input = await payload(req); const email = emailField(input.email);
+          ownerOnly(project, user);
+          const input = await payload(req);
+          const email = emailField(input.email);
+          const role = input.role && ['Engagement Manager', 'Reviewer', 'Team Member'].includes(input.role) ? input.role : 'Team Member';
           requireValue(!user.demo, 'Use a registered team account to add project members.', 403);
-          const member = db.prepare('SELECT * FROM users WHERE email=? AND active=1 AND demo=0').get(email); requireValue(member, 'This person must join the team before being added to a project.', 404);
+          const member = db.prepare('SELECT * FROM users WHERE email=? AND active=1 AND demo=0').get(email);
+          requireValue(member, 'This person must join the team before being added to a project.', 404);
           requireValue(!db.prepare('SELECT user_id FROM memberships WHERE project_id=? AND user_id=?').get(project.id, member.id), 'This person already belongs to the project.', 409);
-          transaction(() => { db.prepare('INSERT INTO memberships VALUES (?,?)').run(project.id, member.id); activity(project.id, user.id, `Added ${member.name} to the project`); }); respond(res, 201, { ok: true }); return;
+          transaction(() => {
+            db.prepare('INSERT INTO memberships (project_id, user_id, role) VALUES (?,?,?)').run(project.id, member.id, role);
+            activity(project.id, user.id, `Added ${member.name} (${role}) to the project`);
+          });
+          respond(res, 201, { ok: true });
+          return;
         }
         const memberMatch = /^members\/([\w-]+)$/.exec(suffix);
+        if (memberMatch && method === 'PATCH') {
+          ownerOnly(project, user);
+          const input = await payload(req);
+          requireValue(['Engagement Manager', 'Reviewer', 'Team Member'].includes(input.role), 'Choose a valid member role.');
+          const member = db.prepare('SELECT u.* FROM memberships m JOIN users u ON u.id=m.user_id WHERE project_id=? AND user_id=?').get(project.id, memberMatch[1]);
+          requireValue(member, 'Member not found.', 404);
+          transaction(() => {
+            db.prepare('UPDATE memberships SET role=? WHERE project_id=? AND user_id=?').run(input.role, project.id, member.id);
+            activity(project.id, user.id, `Updated ${member.name}'s role to ${input.role}`);
+          });
+          respond(res, 200, { ok: true });
+          return;
+        }
         if (memberMatch && method === 'DELETE') {
           ownerOnly(project, user); requireValue(memberMatch[1] !== project.owner_id, 'The project owner cannot be removed.');
           const member = db.prepare('SELECT u.* FROM memberships m JOIN users u ON u.id=m.user_id WHERE project_id=? AND user_id=?').get(project.id, memberMatch[1]); requireValue(member, 'Member not found.', 404);
