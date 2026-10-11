@@ -2054,6 +2054,46 @@ function renderProject() {
    SETTINGS VIEW (SUPER USER)
    ========================================================================== */
 
+// Local AI runtime status and the workspace switch. Models run on this computer through Ollama.
+const AI_STATUS = {
+  disabled: ['Off', 'status-neutral', 'AI assistance is turned off for this workspace.'],
+  ready: ['Ready', 'status-active', 'The local runtime is reachable and both models are installed.'],
+  models_missing: ['Models missing', 'status-review', 'The local runtime is reachable, but a model still needs to be downloaded.'],
+  unavailable: ['Not reachable', 'status-draft', 'The local runtime is not responding. Start Ollama on this computer, then check again.']
+};
+
+function aiSettingsPanel(settings, health) {
+  const [label, tone, text] = AI_STATUS[health.status] || AI_STATUS.unavailable;
+  const rows = health.enabled ? [
+    ['Runtime', `${health.runtime === 'ollama' ? 'Ollama' : e(health.runtime)}${health.version ? ` ${e(health.version)}` : ''} on this computer`],
+    ['Drafting model', `<code>${e(health.chatModel)}</code>`],
+    ['Search model', `<code>${e(health.embedModel)}</code>`]
+  ] : [];
+  return `
+    <section class="panel settings-panel">
+      <div class="panel-heading">
+        <div>
+          <h2>AI assistance</h2>
+          <p style="font-size:12px;color:var(--text-muted);margin-top:2px;">Drafting and search run on a local model. Prompts and documents never leave this computer.</p>
+        </div>
+        <span class="module-icon tone-blue">${icon('spark')}</span>
+      </div>
+      <div class="ai-status">
+        <span class="badge ${tone}"><span class="badge-dot"></span>${label}</span>
+        <p>${text}</p>
+      </div>
+      ${rows.length ? `<dl class="ai-details">${rows.map(([term, value]) => `<div><dt>${term}</dt><dd>${value}</dd></div>`).join('')}</dl>` : ''}
+      ${health.missing?.length ? `
+        <div class="inline-note">${icon('info')}<span>Download the missing ${health.missing.length === 1 ? 'model' : 'models'} once, while connected: ${health.missing.map(m => `<code>ollama pull ${e(m)}</code>`).join(' ')}</span></div>
+      ` : ''}
+      <div class="form-actions">
+        ${health.enabled ? button(icon('clock') + ' Check again', 'ai-recheck', 'btn secondary') : ''}
+        ${button(settings.aiEnabled ? 'Turn off AI assistance' : `${icon('spark')} Turn on AI assistance`, 'toggle-ai', settings.aiEnabled ? 'btn secondary' : 'btn primary', `data-enabled="${settings.aiEnabled ? 'false' : 'true'}"`)}
+      </div>
+    </section>
+  `;
+}
+
 async function renderSettings() {
   if (state.user.role !== 'super_user' || state.user.demo) {
     location.hash = '#desk';
@@ -2088,6 +2128,8 @@ async function renderSettings() {
         </form>
       </section>
     `;
+  } else if (state.settingsTab === 'ai') {
+    content = aiSettingsPanel(s, await api('/ai/health'));
   } else if (state.settingsTab === 'templates') {
     content = `
       <section class="panel settings-panel">
@@ -2169,7 +2211,7 @@ async function renderSettings() {
     </section>
 
     <div class="project-tabs" role="tablist" aria-label="Settings sections">
-      ${[['workspace', 'Workspace'], ['team', 'Team & access'], ['templates', 'Memo template']].map(([key, label]) => `
+      ${[['workspace', 'Workspace'], ['team', 'Team & access'], ['templates', 'Memo template'], ['ai', 'AI assistance']].map(([key, label]) => `
         <button class="${state.settingsTab === key ? 'active' : ''}" role="tab" aria-selected="${state.settingsTab === key}" data-action="settings-tab" data-tab="${key}">${label}</button>
       `).join('')}
     </div>
@@ -3352,6 +3394,13 @@ document.addEventListener('click', async event => {
           target.textContent = state.editing.kind === 'memo' ? 'Create memo outline' : 'Create deck outline';
         }
       }
+    } else if (action === 'toggle-ai') {
+      const result = await send('/settings/ai', { enabled: target.dataset.enabled === 'true' }, 'PATCH');
+      state.workspace = result.settings;
+      await renderSettings();
+      toast(result.settings.aiEnabled ? 'AI assistance turned on.' : 'AI assistance turned off.');
+    } else if (action === 'ai-recheck') {
+      await renderSettings();
     } else if (action === 'toggle-export-menu') {
       setExportMenu(document.querySelector('#export-menu-list')?.hidden);
     } else if (action === 'memo-stage') {

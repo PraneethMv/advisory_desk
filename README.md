@@ -2,7 +2,7 @@
 
 A sovereign, local-first web application designed for technical accounting and advisory teams. Built with a clean, minimal Material 3 aesthetic, Advisory Desk provides an operational workbench for technical accounting memorandums, executive presentation decks, and multi-framework engagement management.
 
-**AI is intentionally deferred to later phases.** Memo and deck intake produce deterministic, structured, and editable outlines. The application performs zero network egress, calls no external cloud APIs, and keeps all client facts, evidence, and deliverables contained on your local machine.
+**AI runs locally, and only when switched on.** Memo and deck intake produce deterministic, structured, and editable outlines. Optional AI assistance uses a model running on the same computer through [Ollama](https://ollama.com); it is off until the super user turns it on in **Settings → AI assistance**. The application calls no external cloud APIs and keeps all client facts, evidence, and deliverables contained on your local machine.
 
 ---
 
@@ -101,7 +101,7 @@ Exports always reflect the latest saved draft version in the database.
 
 ## Security & Data Isolation Guarantees
 
-1. **Zero External Egress**: The server binds to `127.0.0.1` by default. There are no tracking scripts, analytics, external web fonts, or CDN dependencies.
+1. **Zero External Egress**: The server binds to `127.0.0.1` by default. There are no tracking scripts, analytics, external web fonts, or CDN dependencies. The AI runtime is reached only at a loopback address; the server refuses to start if `ADVISORY_AI_URL` points anywhere else.
 2. **Strict Project Sandboxing**: Every request for project details, members, evidence, drafts, and exports verifies project membership on the server. Super users cannot access a project without explicit membership.
 3. **Session & Mutation Security**:
    - Passwords hashed using salted `scrypt`.
@@ -188,6 +188,27 @@ To deploy for an internal advisory team:
    ```
 3. Place behind your organization's internal HTTPS reverse proxy with appropriate firewall and backup policies.
 
+### Local AI runtime (optional)
+
+AI assistance needs [Ollama](https://ollama.com) on the same machine as the server. Install it, then download the models once while connected:
+
+```powershell
+ollama pull gemma4:e4b
+ollama pull embeddinggemma
+```
+
+Turn off Ollama's cloud features with `"disable_ollama_cloud": true` in `~/.ollama/server.json` or `OLLAMA_NO_CLOUD=1`, then restart Ollama. Its log should show `Ollama cloud disabled: true`. Finally, turn AI on in **Settings → AI assistance**, which shows whether the runtime is reachable and both models are installed.
+
+These variables change the defaults:
+
+```dotenv
+ADVISORY_AI_URL=http://127.0.0.1:11434      # must be a loopback address
+ADVISORY_AI_CHAT_MODEL=gemma4:e4b
+ADVISORY_AI_EMBED_MODEL=embeddinggemma
+```
+
+On a 16 GB machine without a GPU, `gemma4:e4b` writes about 15–18 tokens per second. Larger models such as `gemma4:12b` did not fit alongside a typical desktop session in testing.
+
 ---
 
 ## Roadmap
@@ -195,4 +216,4 @@ To deploy for an internal advisory team:
 - **Engagement Creation Flow**: Dedicated multi-step wizard for configuring new client advisory workstreams.
 - **Knowledge Base (Phase 2)**: Authoritative standards library with offline paragraph indexing across IFRS, Ind AS, and US GAAP (ASC topics).
 - **FS Sanity Checks (Phase 2)**: Automated casting, cross-statement referencing, and balance verification.
-- **Local AI Agents**: Optional, network-contained offline model integration for technical memo drafting assistance without cloud egress.
+- **Local AI Agents**: Phase 0 is in place: a local model provider (Ollama, `gemma4:e4b` for drafting and `embeddinggemma` for search), a runtime health check, and the workspace switch. Next: indexing Engagement Documents, retrieval with a source inspector, and grounded drafting in the Memo Builder. See `reference/Accounting_Advisory_Memo_AI_RAG_Implementation_Proposal.md`.

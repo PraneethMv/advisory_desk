@@ -7,12 +7,21 @@ import { createApp } from '../server.mjs';
 import { buildDraft } from '../lib/drafts.mjs';
 import { exportDocument } from '../lib/exports.mjs';
 import { memoFromBody } from '../lib/memo.mjs';
+import { createOllamaProvider, loopbackUrl, AIUnavailableError } from '../lib/ai/provider.mjs';
+
+// Stands in for the local model runtime so tests never depend on Ollama running.
+const fakeAI = {
+  name: 'ollama',
+  healthCalls: 0,
+  result: { reachable: true, version: '0.0.0-test', chatModel: 'gemma4:e4b', embedModel: 'embeddinggemma', missing: [] },
+  async health() { this.healthCalls++; return this.result; }
+};
 
 let app, origin, dataDir;
 before(async () => {
   await mkdir(resolve('test-results'), { recursive: true });
   dataDir = await mkdtemp(resolve('test-results', 'workspace-'));
-  app = await createApp({ dataDir, allowDemo: true });
+  app = await createApp({ dataDir, allowDemo: true, aiProvider: fakeAI });
   await new Promise(done => app.server.listen(0, '127.0.0.1', done));
   origin = `http://127.0.0.1:${app.server.address().port}`;
 });
@@ -963,4 +972,84 @@ test('PDF export is a well-formed multi-page document with WinAnsi text', () => 
   const entries = text.slice(xrefAt).split('\n').filter(line => / 00000 n $/.test(line));
   entries.forEach((entry, i) => assert.ok(text.startsWith(`${i + 1} 0 obj`, Number(entry.slice(0, 10)))));
   assert.ok(text.includes('<506f696e74203120972064e974'), 'Em dash and accents map to WinAnsi bytes ("Point 1 — dé")');
+});
+
+test('the AI provider only talks to a loopback runtime and reports health without running a model', async () => {
+  for (const url of ['http://127.0.0.1:11434', 'http://localhost:11434', 'http://[::1]:11434']) assert.equal(loopbackUrl(url), url);
+  for (const url of ['https://127.0.0.1:11434', 'http://0.0.0.0:11434', 'http://192.168.1.20:11434', 'http://ollama.example.com', 'http://user:pw@127.0.0.1:11434', 'http://127.0.0.1:11434/proxy', 'not a url']) {
+    assert.throws(() => loopbackUrl(url), /AI runtime/);
+  }
+  assert.throws(() => createOllamaProvider({ baseUrl: 'http://10.0.0.5:11434' }), /local address/);
+
+  const requests = [];
+  const fakeFetch = async (url, init = {}) => {
+    requests.push({ url, init });
+    const path = new URL(url).pathname;
+    const reply = {
+      '/api/version': { version: '0.40.3' },
+      '/api/tags': { models: [{ name: 'gemma4:e4b' }, { name: 'embeddinggemma:latest' }] },
+      '/api/chat': { message: { content: '{"ok":true}' }, prompt_eval_count: 12, eval_count: 5, total_duration: 2_000_000_000 },
+      '/api/embed': { embeddings: [[0.1, 0.2]] }
+    }[path];
+    return new Response(JSON.stringify(reply), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+  const provider = createOllamaProvider({ baseUrl: 'http://127.0.0.1:11434' }, fakeFetch);
+  assert.deepEqual(await provider.health(), { reachable: true, version: '0.40.3', chatModel: 'gemma4:e4b', embedModel: 'embeddinggemma', missing: [] });
+  assert.ok(requests.every(r => r.url.startsWith('http://127.0.0.1:11434/') && r.init.method === 'GET'), 'Health only reads version and installed models');
+
+  const chat = await provider.chat({ messages: [{ role: 'user', content: 'Hi' }], format: { type: 'object' }, think: true });
+  assert.deepEqual(chat, { content: '{"ok":true}', thinking: '', usage: { promptTokens: 12, outputTokens: 5, totalMs: 2000 } });
+  const chatBody = JSON.parse(requests.at(-1).init.body);
+  assert.equal(chatBody.model, 'gemma4:e4b');
+  assert.equal(chatBody.stream, false);
+  assert.equal(chatBody.think, true);
+  assert.deepEqual(chatBody.format, { type: 'object' });
+  assert.equal(requests.at(-1).init.redirect, 'error', 'Redirects to another host are refused');
+  assert.deepEqual(await provider.embed(['passage']), [[0.1, 0.2]]);
+
+  const missing = createOllamaProvider({ chatModel: 'gemma4:12b' }, fakeFetch);
+  assert.deepEqual((await missing.health()).missing, ['gemma4:12b']);
+
+  const down = createOllamaProvider({}, async () => { throw new TypeError('fetch failed'); });
+  const health = await down.health();
+  assert.equal(health.reachable, false);
+  assert.match(health.error, /not reachable/);
+  await assert.rejects(down.chat({ messages: [] }), AIUnavailableError);
+
+  const failing = createOllamaProvider({}, async () => new Response(JSON.stringify({ error: 'model not found' }), { status: 404 }));
+  await assert.rejects(failing.embed(['x']), /model not found/);
+});
+
+test('AI assistance is off by default; only the super user can switch it and see runtime details', async () => {
+  assert.equal((await client().request('/ai/health')).status, 401);
+  const owner = client();
+  await owner.request('/auth/login', 'POST', { email: 'owner@example.test', password: 'correct horse battery staple' });
+  const member = client();
+  await member.request('/auth/demo', 'POST', {});
+
+  fakeAI.healthCalls = 0;
+  assert.deepEqual((await owner.request('/ai/health')).body, { enabled: false, status: 'disabled' });
+  assert.equal(fakeAI.healthCalls, 0, 'A disabled workspace never contacts the runtime');
+  assert.equal((await owner.request('/me')).body.workspace.aiEnabled, false);
+
+  assert.equal((await member.request('/settings/ai', 'PATCH', { enabled: true })).status, 403);
+  assert.equal((await owner.request('/settings/ai', 'PATCH', { enabled: 'yes' })).status, 400);
+  assert.equal((await owner.request('/settings/ai', 'PATCH', { enabled: true })).status, 200);
+  try {
+    assert.deepEqual((await owner.request('/ai/health')).body, { enabled: true, status: 'ready', runtime: 'ollama', version: '0.0.0-test', chatModel: 'gemma4:e4b', embedModel: 'embeddinggemma', missing: [], error: '' });
+    assert.deepEqual((await member.request('/ai/health')).body, { enabled: true, status: 'ready' }, 'Members see whether AI is usable, not runtime details');
+
+    fakeAI.result = { ...fakeAI.result, missing: ['embeddinggemma'] };
+    assert.equal((await owner.request('/ai/health')).body.status, 'models_missing');
+    fakeAI.result = { ...fakeAI.result, reachable: false, missing: [], error: 'The local AI runtime is not reachable.' };
+    assert.equal((await member.request('/ai/health')).body.status, 'unavailable');
+
+    // Saving the other workspace settings keeps the AI switch as it was.
+    const { settings } = (await owner.request('/settings')).body;
+    assert.equal((await owner.request('/settings', 'PATCH', { workspaceName: settings.workspaceName, memoTemplateName: settings.memoTemplateName, memoHeadings: settings.memoHeadings })).body.settings.aiEnabled, true);
+  } finally {
+    fakeAI.result = { reachable: true, version: '0.0.0-test', chatModel: 'gemma4:e4b', embedModel: 'embeddinggemma', missing: [] };
+    assert.equal((await owner.request('/settings/ai', 'PATCH', { enabled: false })).status, 200);
+  }
+  assert.equal((await member.request('/ai/health')).body.status, 'disabled');
 });

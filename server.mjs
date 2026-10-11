@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import { DatabaseSync } from 'node:sqlite';
 import { buildDraft, STANDARD_CATALOG } from './lib/drafts.mjs';
 import { exportDocument } from './lib/exports.mjs';
+import { createOllamaProvider, aiConfigFromEnv } from './lib/ai/provider.mjs';
 import { MEMO_GUIDE, DEFAULT_MEMO_HEADINGS, SECTION_STATUSES, COMPLETION_CHECKLIST, allSectionsReady, composeMemo, memoFromBody, normaliseMemo } from './lib/memo.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -32,7 +33,8 @@ const LEGACY_MEMO_HEADINGS = [
   'Purpose and scope\nBackground and facts\nAccounting questions\nApplicable guidance\nAnalysis\nConclusion\nProject evidence\nReview checklist',
   [...DEFAULT_MEMO_HEADINGS, 'References and evidence'].join('\n')
 ];
-const DEFAULT_SETTINGS = { workspaceName: 'Advisory team', memoTemplateName: 'Technical accounting memorandum', memoHeadings: DEFAULT_MEMO_HEADINGS.join('\n') };
+// AI assistance stays off until the super user turns it on.
+const DEFAULT_SETTINGS = { workspaceName: 'Advisory team', memoTemplateName: 'Technical accounting memorandum', memoHeadings: DEFAULT_MEMO_HEADINGS.join('\n'), aiEnabled: false };
 const MEMO_GUIDE_PUBLIC = MEMO_GUIDE.map(({ heading, aliases, hint }) => ({ heading, aliases, hint }));
 class ApiError extends Error { constructor(status, message) { super(message); this.status = status; } }
 function requireValue(condition, message, status = 400) { if (!condition) throw new ApiError(status, message); }
@@ -120,6 +122,8 @@ export async function createApp(options = {}) {
   const dataDir = resolve(options.dataDir || process.env.ADVISORY_DATA_DIR || resolve(ROOT, 'data'));
   await mkdir(dataDir, { recursive: true });
   const db = new DatabaseSync(resolve(dataDir, 'advisory.sqlite'));
+  // Local model runtime; tests pass a stand-in. Creation fails fast on a non-local URL.
+  const ai = options.aiProvider || createOllamaProvider(aiConfigFromEnv());
   db.exec(`
     PRAGMA journal_mode = WAL;
     PRAGMA foreign_keys = ON;
@@ -435,9 +439,25 @@ export async function createApp(options = {}) {
       }
       if (path === '/api/settings' && method === 'PATCH') {
         adminOnly(user); const input = await payload(req);
-        const settings = { workspaceName: textField(input.workspaceName, 'Workspace name', 80), memoTemplateName: textField(input.memoTemplateName, 'Memo template name', 120), memoHeadings: textField(input.memoHeadings, 'Memo headings', 3000) };
+        const settings = { workspaceName: textField(input.workspaceName, 'Workspace name', 80), memoTemplateName: textField(input.memoTemplateName, 'Memo template name', 120), memoHeadings: textField(input.memoHeadings, 'Memo headings', 3000), aiEnabled: Boolean(getSettings().aiEnabled) };
         requireValue(settings.memoHeadings.split('\n').filter(x => x.trim()).length <= 20, 'Use up to 20 template headings.');
         db.prepare('UPDATE settings SET value=? WHERE key=?').run(JSON.stringify(settings), 'workspace'); respond(res, 200, { settings }); return;
+      }
+      if (path === '/api/settings/ai' && method === 'PATCH') {
+        adminOnly(user); const input = await payload(req);
+        requireValue(typeof input.enabled === 'boolean', 'Choose whether AI assistance is on.');
+        const settings = { ...getSettings(), aiEnabled: input.enabled };
+        db.prepare('UPDATE settings SET value=? WHERE key=?').run(JSON.stringify(settings), 'workspace'); respond(res, 200, { settings }); return;
+      }
+      if (path === '/api/ai/health' && method === 'GET') {
+        // Everyone learns whether AI is usable; only the super user sees runtime and model details.
+        if (!getSettings().aiEnabled) { respond(res, 200, { enabled: false, status: 'disabled' }); return; }
+        const health = await ai.health();
+        const status = !health.reachable ? 'unavailable' : health.missing.length ? 'models_missing' : 'ready';
+        const details = user.role === 'super_user' && !user.demo
+          ? { runtime: ai.name, version: health.version, chatModel: health.chatModel, embedModel: health.embedModel, missing: health.missing, error: health.error || '' }
+          : {};
+        respond(res, 200, { enabled: true, status, ...details }); return;
       }
       if (path === '/api/invitations' && method === 'POST') {
         adminOnly(user); const input = await payload(req); const email = emailField(input.email);
@@ -786,6 +806,6 @@ export async function createApp(options = {}) {
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const app = await createApp(); const host = process.env.HOST || '127.0.0.1'; const port = Number(process.env.PORT || 3000);
-  app.server.listen(port, host, () => console.log(`Advisory Desk alpha: http://${host}:${port}\nData is stored locally. AI is deferred. First registered team account becomes the super user.`));
+  app.server.listen(port, host, () => console.log(`Advisory Desk alpha: http://${host}:${port}\nData is stored locally. AI assistance uses a local model and is off until enabled in Settings. First registered team account becomes the super user.`));
   for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, async () => { await app.close(); process.exit(0); });
 }
