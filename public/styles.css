@@ -3019,32 +3019,19 @@ tbody td {
   gap: 6px;
 }
 
-.move-final-action-btn {
-  font-size: 11px;
-  padding: 3px 8px;
-  height: 26px;
-  gap: 4px;
-  border-radius: 6px;
-  font-weight: 550;
-  white-space: nowrap;
+/* Engagement Documents selection for moving documents to Final Deliverables */
+.document-select {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  accent-color: var(--brand-blue);
+  cursor: pointer;
 }
 
-.final-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 11px;
-  font-weight: 600;
-  padding: 2px 7px;
-  border-radius: 6px;
-  background: var(--brand-blue-container);
+.final-document-project {
   color: var(--brand-blue);
-  white-space: nowrap;
-}
-
-.final-chip .icon {
-  width: 12px;
-  height: 12px;
+  font-weight: 600;
+  text-decoration: none;
 }
 
 .quiet-ghost-action {
@@ -4038,6 +4025,61 @@ textarea {
   font-size: 12.5px;
   color: var(--text-secondary);
   margin-bottom: 14px;
+  gap: 12px;
+}
+
+/* Workstream export: one icon button with a format menu */
+.export-menu {
+  position: relative;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+.export-menu-trigger {
+  width: auto;
+  height: 34px;
+  gap: 2px;
+  padding: 0 8px;
+  border: 1px solid var(--outline);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+}
+.export-menu-trigger[aria-expanded="true"] {
+  border-color: var(--brand-blue);
+  color: var(--brand-blue);
+}
+.export-menu-trigger .icon {
+  width: 17px;
+  height: 17px;
+}
+.export-menu-trigger .export-menu-caret {
+  width: 13px;
+  height: 13px;
+  color: var(--text-muted);
+}
+.export-menu-list {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 6px);
+  right: 0;
+  width: 240px;
+  padding: 5px;
+  display: flex;
+  flex-direction: column;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+}
+.export-menu-list[hidden] {
+  display: none;
+}
+.export-menu-list .workstream-menu-item {
+  text-decoration: none;
+}
+.export-menu-list .icon {
+  width: 16px;
+  height: 16px;
+  color: var(--text-muted);
 }
 
 .editor-grid {
@@ -4544,7 +4586,7 @@ textarea {
   padding: 12px 20px;
   border-radius: var(--radius-md);
   background: var(--text-primary);
-  color: #ffffff;
+  color: var(--bg-surface);
   font-size: 13px;
   font-weight: 500;
   transform: translateY(100px);
@@ -5409,11 +5451,24 @@ textarea {
   }
 }
 
-.memo-dirty {
-  white-space: nowrap;
+/* Toolkit autosave status, left of the footer actions */
+.draft-status {
+  margin-right: auto;
   font-size: 12px;
   font-weight: 600;
-  color: var(--memo-drafting);
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.draft-status[data-tone="pending"] {
+  color: #b06000;
+}
+[data-theme="dark"] .draft-status[data-tone="pending"] {
+  color: #f59e0b;
+}
+.draft-status[data-tone="error"] {
+  color: var(--destructive);
 }
 
 @media (max-width: 1080px) {

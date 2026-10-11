@@ -158,8 +158,8 @@ function toggleWorkstreamMenu(trigger) {
   const attrs = `data-project="${e(project.id)}" data-id="${e(delivery.id)}"`;
   workstreamMenu.innerHTML = `
     <button type="button" role="menuitem" class="workstream-menu-item" data-action="edit-delivery" ${attrs}>${icon('arrow')} Open toolkit</button>
-    ${!delivery.is_final && delivery.status !== 'Setup' ? `
-      <button type="button" role="menuitem" class="workstream-menu-item" data-action="promote-to-final" ${attrs}>${icon('check')} Move to Final</button>
+    ${delivery.status !== 'Setup' ? `
+      <button type="button" role="menuitem" class="workstream-menu-item" data-action="add-to-documents" ${attrs}>${icon('upload')} Add to Engagement Documents</button>
     ` : ''}
     ${delivery.created_by === state.user.id || project.owner_id === state.user.id ? `
       <button type="button" role="menuitem" class="workstream-menu-item destructive" data-action="delete-workstream" ${attrs} data-name="${e(delivery.title)}">${icon('trash')} Delete</button>
@@ -507,9 +507,9 @@ function report(error) {
 
 async function refreshWorkspace() {
   if (!state.user) return;
-  const [projects, deliverables] = await Promise.all([api('/projects'), api('/deliverables')]);
+  const [projects, finals] = await Promise.all([api('/projects'), api('/final-deliverables')]);
   state.projects = projects.projects;
-  state.deliverables = deliverables.deliverables;
+  state.finalDocuments = finals.documents;
 }
 
 function setSession(data) {
@@ -877,12 +877,12 @@ function shell(content, title = 'Projects', trail = '') {
     </div>
   `;
 
-  const finalDeliverablesCount = isProject ? (projectData.deliverables?.filter(d => Boolean(d.is_final))?.length || 0) : 0;
+  const finalDeliverablesCount = isProject ? (projectData.resources?.filter(r => r.is_final)?.length || 0) : 0;
   const sidebarNav = isProject ? `
     <div class="nav-label">WORKSPACE</div>
     <nav aria-label="Project navigation">
       ${projectTabNav('overview', 'Dashboard', 'dashboard')}
-      ${projectTabNav('resources', 'Project Resources', 'folder', projectData.resources?.length)}
+      ${projectTabNav('resources', 'Project Resources', 'folder', projectData.resources?.filter(r => !r.is_final).length)}
       ${projectTabNav('deliverables', 'Final Deliverables', 'slides', finalDeliverablesCount)}
       ${projectTabNav('setup', 'Engagement Setup', 'hierarchy', projectData.members?.length)}
     </nav>
@@ -1372,62 +1372,65 @@ function openKnowledgeBase() {
    DELIVERABLES, ACTIVITY, AND PROJECT VIEWS
    ========================================================================== */
 
-function deliveryRows(deliverables, projectId = '') {
-  if (!deliverables.length) return empty('Room for your first deliverable.', 'Start a memo or deck brief from your project overview.');
-  return `
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Deliverable</th>
-            ${!projectId ? '<th>Project</th>' : ''}
-            <th>Status</th>
-            <th>Updated</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          ${deliverables.map(d => `
-            <tr>
-              <td>
-                <button class="table-project" data-action="edit-delivery" data-project="${projectId || d.project_id}" data-id="${d.id}">
-                  <span class="project-icon ${d.kind === 'memo' ? 'tone-blue' : 'tone-red'}">${icon(d.kind === 'memo' ? 'file' : 'slides')}</span>
-                  <span>
-                    <strong>${e(d.title)}</strong>
-                    <small>${d.kind === 'memo' ? 'Technical memo' : 'Slide deck'}</small>
-                  </span>
-                </button>
-              </td>
-              ${!projectId ? `<td><a class="table-link" href="#project/${d.project_id}" style="color:var(--brand-blue);font-weight:600;">${e(d.project_name)}</a></td>` : ''}
-              <td>${badge(d.status)}</td>
-              <td class="table-date" style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted);">${date(d.updated)}</td>
-              <td>
-                ${button(icon('arrow'), 'edit-delivery', 'icon-btn', `data-project="${projectId || d.project_id}" data-id="${d.id}" aria-label="Open deliverable"`)}
-              </td>
-            </tr>
-          `).join('')}
-        </tbody>
-      </table>
-    </div>
-  `;
-}
-
 function renderDeliverables() {
-  const finalDeliverables = (state.deliverables || []).filter(d => Boolean(d.is_final));
+  const documents = state.finalDocuments || [];
   shell(`
     <section class="page-heading">
       <div>
         <h1>Final Deliverables<span class="heading-dot">.</span></h1>
-        <p>The finalized technical memos and presentation decks across your projects.</p>
+        <p>Documents moved to Final Deliverables across your projects.</p>
       </div>
-      <span class="matrix-parameter-pill">${icon('file')} ${finalDeliverables.length} final deliverable${finalDeliverables.length === 1 ? '' : 's'}</span>
+      <span class="matrix-parameter-pill">${icon('file')} ${documents.length} final deliverable${documents.length === 1 ? '' : 's'}</span>
     </section>
     <div class="inline-note" style="margin-bottom:20px;">
       ${icon('info')}
-      <span>Deliverables are added here when explicitly moved to Final Deliverables from their engagement workstream.</span>
+      <span>Every document starts in its engagement's Engagement Documents. Select documents there and move them here when they are final.</span>
     </div>
-    ${finalDeliverables.length ? deliveryRows(finalDeliverables) : empty('No final deliverables yet.', 'Working outlines and drafts remain in their project workstreams until explicitly moved to Final Deliverables.')}
+    ${documents.length ? finalDocumentRows(documents) : empty('No final deliverables yet.', 'Select documents in an engagement\'s Engagement Documents and move them to Final Deliverables.')}
   `, 'Deliverables');
+}
+
+const documentKind = r => r.kind === 'template' ? 'Company template' : r.kind === 'draft' ? 'Workstream draft' : r.kind === 'export' ? 'Workstream export' : 'Reference';
+const documentIcon = r => icon(r.kind === 'template' ? 'book' : r.kind === 'export' ? 'download' : 'file');
+
+// Final documents; inside a project each row can go back to Engagement Documents.
+function finalDocumentRows(documents, project = null) {
+  return `
+    <div class="quiet-section-card table-container-card">
+      <div class="quiet-table-wrap">
+        <div class="quiet-table-header document-cols">
+          <span>DOCUMENT</span>
+          <span class="document-header-size">SIZE</span>
+          <span class="document-header-author">${project ? 'TYPE' : 'PROJECT'}</span>
+          <span class="document-header-time">ADDED</span>
+          <span></span>
+        </div>
+        <div class="resource-list document-table-list">
+          ${documents.map(r => {
+            const projectId = project?.id || r.project_id;
+            return `
+              <div class="resource-row quiet-data-row document-cols">
+                <div class="document-col-name">
+                  <span class="quiet-type-icon tone-blue">${documentIcon(r)}</span>
+                  <div class="quiet-name-group">
+                    <strong class="resource-title">${e(r.name)}</strong>
+                    <small class="resource-meta">${documentKind(r)}</small>
+                  </div>
+                </div>
+                <div class="document-col-size"><code>${size(r.size)}</code></div>
+                <div class="document-col-author">${project ? `<span>${documentKind(r)}</span>` : `<a href="#project/${projectId}" class="final-document-project">${e(r.project_name)}</a>`}</div>
+                <div class="document-col-time"><span class="font-mono text-muted">${formatDateTime(r.created)}</span></div>
+                <div class="document-col-action">
+                  <a class="quiet-ghost-action" href="/api/projects/${projectId}/resources/${r.id}" aria-label="Download ${e(r.name)}" title="Download">${icon('download')}</a>
+                  ${project ? button(icon('arrow', 'icon-flip'), 'return-to-documents', 'quiet-ghost-action', `data-id="${r.id}" aria-label="Return ${e(r.name)} to Engagement Documents" title="Return to Engagement Documents"`) : ''}
+                </div>
+              </div>
+            `;
+          }).join('')}
+        </div>
+      </div>
+    </div>
+  `;
 }
 
 function activityList(items, global = false) {
@@ -1475,10 +1478,10 @@ function resourceRows(resources, compact = false) {
     <div class="resource-list">
       ${resources.slice(0, compact ? 4 : undefined).map(r => `
         <div class="resource-row">
-          <span class="resource-icon">${icon(r.kind === 'template' ? 'book' : (r.kind === 'export' ? 'download' : 'file'))}</span>
+          <span class="resource-icon">${documentIcon(r)}</span>
           <div class="resource-name">
             <strong>${e(r.name)}</strong>
-            <small>${r.kind === 'template' ? 'Company template' : (r.kind === 'draft' ? 'Workstream draft' : (r.kind === 'export' ? 'Workstream export' : 'Reference'))} <span>·</span> ${size(r.size)} <span>·</span> ${date(r.created)}</small>
+            <small>${documentKind(r)} <span>·</span> ${size(r.size)} <span>·</span> ${date(r.created)}</small>
           </div>
           <a class="icon-btn" href="/api/projects/${p.id}/resources/${r.id}" aria-label="Download ${e(r.name)}" title="Download">${icon('download')}</a>
           ${!compact && (r.created_by === state.user.id || p.owner_id === state.user.id) ? button(icon('trash'), 'delete-resource', 'icon-btn subtle-danger', `data-id="${r.id}" data-name="${e(r.name)}" aria-label="Remove ${e(r.name)}"`) : ''}
@@ -1744,10 +1747,13 @@ function renderProject() {
   const p = data.project;
   const owner = p.owner_id === state.user.id;
   const activeTab = (state.projectTab === 'team') ? 'setup' : (state.projectTab || 'overview');
+  // Documents live in Engagement Documents until they are moved to Final Deliverables.
+  const documents = data.resources.filter(r => !r.is_final);
+  const finalDocuments = data.resources.filter(r => r.is_final);
   const tabs = [
     ['overview', 'Dashboard'],
-    ['resources', 'Project Resources', data.resources.length],
-    ['deliverables', 'Final Deliverables', data.deliverables.length],
+    ['resources', 'Project Resources', documents.length],
+    ['deliverables', 'Final Deliverables', finalDocuments.length],
     ['setup', 'Engagement Setup', data.members.length],
     ['activity', 'Activity']
   ];
@@ -1789,7 +1795,6 @@ function renderProject() {
         <div class="workstream-list">
           ${data.deliverables.map(d => {
             const creator = data.members?.find(m => m.id === d.created_by)?.name || (d.created_by === state.user.id ? state.user.name : 'Team member');
-            const isFinal = Boolean(d.is_final);
             return `
               <div class="workstream-row quiet-data-row workstream-cols" data-action="edit-delivery" data-project="${p.id}" data-id="${d.id}" role="button" tabindex="0">
                 <div class="workstream-col-name">
@@ -1803,7 +1808,7 @@ function renderProject() {
                   <span>${d.kind === 'memo' ? 'Technical memo' : 'Slide deck'}</span>
                 </div>
                 <div class="workstream-col-status">
-                  ${isFinal ? badge('Final') : badge(d.status)}
+                  ${badge(d.status)}
                 </div>
                 <div class="workstream-col-author">
                   <span>${e(creator)}</span>
@@ -1836,7 +1841,7 @@ function renderProject() {
       </div>
     `;
 
-    const documentsTableBody = (!data.resources || data.resources.length === 0)
+    const documentsTableBody = !documents.length
       ? `
         <div class="empty-list-banner quiet-empty-row">
           <span class="empty-list-banner-icon quiet-empty-icon-tile">${icon('file')}</span>
@@ -1848,15 +1853,16 @@ function renderProject() {
       `
       : `
         <div class="resource-list document-table-list">
-          ${data.resources.map(r => {
+          ${documents.map(r => {
             const creator = data.members?.find(m => m.id === r.created_by)?.name || (r.created_by === state.user.id ? state.user.name : 'Team member');
             return `
               <div class="resource-row quiet-data-row document-cols">
                 <div class="document-col-name">
-                  <span class="quiet-type-icon tone-blue">${icon(r.kind === 'template' ? 'book' : (r.kind === 'export' ? 'download' : 'file'))}</span>
+                  <input type="checkbox" class="document-select" value="${r.id}" aria-label="Select ${e(r.name)}">
+                  <span class="quiet-type-icon tone-blue">${documentIcon(r)}</span>
                   <div class="quiet-name-group">
                     <strong class="resource-title">${e(r.name)}</strong>
-                    <small class="resource-meta">${r.kind === 'template' ? 'Company template' : (r.kind === 'draft' ? 'Workstream draft' : (r.kind === 'export' ? 'Workstream export' : 'Reference'))}</small>
+                    <small class="resource-meta">${documentKind(r)}</small>
                   </div>
                 </div>
                 <div class="document-col-size">
@@ -1914,11 +1920,16 @@ function renderProject() {
             <div class="quiet-card-title-group">
               <span class="quiet-section-icon tone-blue">${icon('folder')}</span>
               <h2 id="documents-heading">Engagement Documents</h2>
-              <span class="quiet-count-chip count-bubble">${data.resources.length}</span>
+              <span class="quiet-count-chip count-bubble">${documents.length}</span>
             </div>
-            <button type="button" class="btn outline small-btn quiet-header-btn" data-action="upload-resource">
-              ${icon('upload')} Upload
-            </button>
+            <div class="button-row">
+              <button type="button" class="btn primary small-btn quiet-header-btn" data-action="move-to-final" id="move-to-final-btn" hidden>
+                ${icon('check')} Move to Final Deliverables <span id="move-to-final-count"></span>
+              </button>
+              <button type="button" class="btn outline small-btn quiet-header-btn" data-action="upload-resource">
+                ${icon('upload')} Upload
+              </button>
+            </div>
           </div>
           <div class="quiet-section-card table-container-card">
             ${documentsHtml}
@@ -1976,21 +1987,20 @@ function renderProject() {
         </div>
         ${button(icon('upload') + ' Upload resource', 'upload-resource', 'btn primary small-btn')}
       </div>
-      <section class="panel resource-panel">${resourceRows(data.resources)}</section>
+      <section class="panel resource-panel">${resourceRows(documents)}</section>
       <p class="privacy-footnote" style="font-size:11.5px;color:var(--text-muted);display:flex;align-items:center;gap:6px;margin-top:14px;">
         ${icon('lock')} Files are stored in the local SQLite database and strictly scoped to this project. Maximum 10 MB per file.
       </p>
     `;
   } else if (activeTab === 'deliverables') {
-    const finalDeliverables = (data.deliverables || []).filter(d => Boolean(d.is_final));
     content = `
       <div class="section-heading">
         <div>
           <h2>Final Deliverables</h2>
-          <p>Approved client deliverables and finalized memorandum/presentation documents.</p>
+          <p>Documents moved here from Engagement Documents. Return a document to make it a working document again.</p>
         </div>
       </div>
-      ${finalDeliverables.length ? deliveryRows(finalDeliverables, p.id) : empty('No final deliverables yet.', 'Workstreams in draft or review stay in Engagement Workstreams & Documents. Select "Move to Final Deliverables" on a completed workstream to publish it here.')}
+      ${finalDocuments.length ? finalDocumentRows(finalDocuments, p) : empty('No final deliverables yet.', 'Select documents in Engagement Documents on the dashboard and choose "Move to Final Deliverables".')}
     `;
   } else if (activeTab === 'setup') {
     content = `
@@ -2738,7 +2748,7 @@ function addMemoStandard() {
   }
   input.value = '';
   renderMemoBase();
-  markMemoDirty();
+  markDirty();
 }
 
 function renderMemoReview() {
@@ -2810,11 +2820,54 @@ function autosize(textarea) {
   textarea.style.height = `${textarea.scrollHeight + 2}px`;
 }
 
-function markMemoDirty() {
-  const form = document.querySelector('#edit-delivery-form[data-kind="memo"]');
+/* Toolkit edits autosave shortly after typing stops, which also keeps the
+   workstream's Markdown draft in Engagement Documents current. */
+const AUTOSAVE_DELAY = 2000;
+let autosaveTimer = null;
+let savingWorkstream = null;
+
+function setDraftStatus(text, tone = '') {
+  const node = document.querySelector('#draft-status');
+  if (!node) return;
+  node.textContent = text;
+  node.dataset.tone = tone;
+}
+
+function markDirty() {
+  const form = document.querySelector('#edit-delivery-form');
   if (!form) return;
   form.dataset.dirty = 'true';
-  document.querySelector('#memo-dirty')?.removeAttribute('hidden');
+  setDraftStatus('Unsaved changes', 'pending');
+  clearTimeout(autosaveTimer);
+  autosaveTimer = setTimeout(() => saveWorkstream({ quiet: true }), AUTOSAVE_DELAY);
+}
+
+// Saves the open toolkit. Quiet saves (autosave) report problems in the status line
+// rather than throwing, and skip while required fields are empty.
+async function saveWorkstream({ quiet = false } = {}) {
+  clearTimeout(autosaveTimer);
+  while (savingWorkstream) await savingWorkstream.catch(() => {});
+  const form = document.querySelector('#edit-delivery-form');
+  if (!form || (quiet && form.dataset.dirty !== 'true')) return;
+  if (quiet && !form.checkValidity()) {
+    setDraftStatus('Not saved: complete the required fields', 'error');
+    return;
+  }
+  const editing = state.editing;
+  form.dataset.dirty = 'false';
+  setDraftStatus('Saving…');
+  savingWorkstream = send(`/projects/${state.editingProject}/deliverables/${editing.id}`, { ...deliveryPayload(form), updated: editing.updated }, 'PATCH');
+  try {
+    const result = await savingWorkstream;
+    editing.updated = result.updated;
+    if (form.dataset.dirty !== 'true') setDraftStatus(`Saved ${new Intl.DateTimeFormat('en-IN', { hour: 'numeric', minute: '2-digit' }).format(new Date())}`, 'saved');
+  } catch (error) {
+    form.dataset.dirty = 'true';
+    setDraftStatus(`Not saved: ${error.message}`, 'error');
+    if (!quiet) throw error;
+  } finally {
+    savingWorkstream = null;
+  }
 }
 
 function showMemoView(view) {
@@ -2846,7 +2899,7 @@ function addMemoSection() {
   const card = container.lastElementChild;
   autosize(card.querySelector('.memo-section-body'));
   renderMemoOutline();
-  markMemoDirty();
+  markDirty();
   card.scrollIntoView({ behavior: 'smooth', block: 'center' });
   const heading = card.querySelector('.memo-section-heading');
   heading.focus({ preventScroll: true });
@@ -2856,13 +2909,36 @@ function addMemoSection() {
 function removeMemoSection(id) {
   document.querySelector(`.memo-section[data-section-id="${CSS.escape(id)}"]`)?.remove();
   renderMemoOutline();
-  markMemoDirty();
+  markDirty();
 }
 
 function initMemoEditor(d) {
   renderMemoOutline();
   renderMemoBase();
   showMemoStage(state.memoStage?.id === d.id ? state.memoStage.stage : 'base');
+}
+
+// Exports download the last saved version of the workstream.
+function exportMenu(d, project, id) {
+  const base = `/api/projects/${project}/deliverables/${id}/export`;
+  const office = d.kind === 'memo' ? ['docx', 'Word (.docx)'] : ['pptx', 'PowerPoint (.pptx)'];
+  const formats = [['md', 'Markdown (.md)'], office, ['pdf', 'PDF (.pdf)']];
+  return `
+    <div class="export-menu">
+      ${button(icon('download') + icon('down', 'export-menu-caret'), 'toggle-export-menu', 'icon-btn export-menu-trigger', 'title="Export" aria-label="Export" aria-haspopup="menu" aria-expanded="false" aria-controls="export-menu-list"')}
+      <div class="export-menu-list" id="export-menu-list" role="menu" aria-label="Export" hidden>
+        ${formats.map(([format, label]) => `<a role="menuitem" class="workstream-menu-item" href="${base}/${format}">${icon('file')} ${label}</a>`).join('')}
+      </div>
+    </div>
+  `;
+}
+
+function setExportMenu(open) {
+  const list = document.querySelector('#export-menu-list');
+  if (!list) return;
+  list.hidden = !open;
+  document.querySelector('.export-menu-trigger')?.setAttribute('aria-expanded', String(open));
+  if (open) list.querySelector('[role="menuitem"]')?.focus();
 }
 
 async function editDelivery(project, id) {
@@ -2913,21 +2989,13 @@ async function renderWorkstream(project, id) {
             <input name="title" value="${e(d.title)}" required maxlength="160">
           </label>
           <label>Review status
-            <select name="status">${options(['Draft', 'In review', 'Approved', ...(d.is_final ? ['Final'] : [])], d.status)}</select>
+            <select name="status">${options(['Draft', 'In review', 'Approved', ...(d.status === 'Final' ? ['Final'] : [])], d.status)}</select>
           </label>
         </div>
 
         <div class="editor-toolbar">
           ${isMemo ? memoStageTabs() : `<span>${icon('slides')} Executive Presentation · Live Markdown Preview</span>`}
-          <div class="button-row">
-            <button type="button" class="btn secondary small-btn" data-action="save-export-to-documents" data-project="${project}" data-id="${id}" title="Save ${d.kind === 'memo' ? '.docx' : '.pptx'} export directly to Engagement Documents">
-              ${icon('upload')} Save ${d.kind === 'memo' ? 'Word (.docx)' : 'Deck (.pptx)'} to Documents
-            </button>
-            <a class="btn secondary small-btn" href="/api/projects/${project}/deliverables/${id}/export/md">${icon('download')} Markdown (.md)</a>
-            <a class="btn primary small-btn" href="/api/projects/${project}/deliverables/${id}/export/${d.kind === 'memo' ? 'docx' : 'pptx'}">
-              ${icon('download')} Export ${d.kind === 'memo' ? 'Word (.docx)' : 'PowerPoint (.pptx)'}
-            </a>
-          </div>
+          ${exportMenu(d, project, id)}
         </div>
 
         ${isMemo ? memoEditorLayout(d) : `
@@ -2944,17 +3012,12 @@ async function renderWorkstream(project, id) {
 
         <div class="form-error" role="alert"></div>
         <div class="modal-actions">
-          <span style="font-size:11.5px;color:var(--text-muted);margin-right:auto;">Drafts & exports stay in Engagement Documents until moved to Final Deliverables.</span>
-          ${isMemo ? '<span id="memo-dirty" class="memo-dirty" hidden>Unsaved changes</span>' : ''}
+          <span id="draft-status" class="draft-status" aria-live="polite"></span>
           <a href="#project/${project}" class="btn secondary">Back to engagement</a>
           <button type="submit" class="btn secondary">Save draft ${icon('check')}</button>
-          ${!d.is_final ? `
-            <button type="button" class="btn primary move-to-final-btn" data-action="promote-to-final" data-project="${project}" data-id="${id}">
-              ${icon('check')} Move to Final Deliverables
-            </button>
-          ` : `
-            <span class="final-chip" style="margin-left:8px;">${icon('check')} In Final Deliverables</span>
-          `}
+          <button type="button" class="btn primary" data-action="add-to-documents" data-project="${project}" data-id="${id}">
+            ${icon('upload')} Add to Engagement Documents
+          </button>
         </div>
       </form>
     `;
@@ -3029,6 +3092,8 @@ function confirmAction(title, subtitle, form, data) {
 
 async function route() {
   closeWorkstreamMenu();
+  // Leaving a toolkit flushes its pending autosave before the page is replaced.
+  await saveWorkstream({ quiet: true });
   // If not signed in: always show the Sign-in / Sign-up page first!
   if (!state.user) {
     location.hash = '';
@@ -3287,6 +3352,8 @@ document.addEventListener('click', async event => {
           target.textContent = state.editing.kind === 'memo' ? 'Create memo outline' : 'Create deck outline';
         }
       }
+    } else if (action === 'toggle-export-menu') {
+      setExportMenu(document.querySelector('#export-menu-list')?.hidden);
     } else if (action === 'memo-stage') {
       showMemoStage(target.dataset.stage);
     } else if (action === 'memo-add-standard') {
@@ -3295,7 +3362,7 @@ document.addEventListener('click', async event => {
       const box = [...document.querySelectorAll(`[name="${target.dataset.name}"]`)].find(input => input.value === target.dataset.value);
       if (box) box.checked = false;
       renderMemoBase();
-      markMemoDirty();
+      markDirty();
     } else if (action === 'memo-view') {
       showMemoView(target.dataset.view);
     } else if (action === 'memo-add-section') {
@@ -3306,7 +3373,7 @@ document.addEventListener('click', async event => {
       if (!sibling) return;
       if (target.dataset.dir === '-1') sibling.before(card); else sibling.after(card);
       renderMemoOutline();
-      markMemoDirty();
+      markDirty();
       card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       (target.disabled ? card.querySelector('.memo-section-heading') : target).focus({ preventScroll: true });
     } else if (action === 'memo-toggle-section') {
@@ -3333,43 +3400,22 @@ document.addEventListener('click', async event => {
       autosize(card.querySelector('.memo-section-body'));
       card.scrollIntoView({ behavior: 'smooth', block: 'start' });
       card.querySelector('.memo-section-body').focus({ preventScroll: true });
-    } else if (action === 'promote-to-final') {
+    } else if (action === 'add-to-documents') {
+      // Creates the Word (memo) or PowerPoint (deck) document, from the latest edits when the toolkit is open.
       event.stopPropagation();
-      const projectId = target.dataset.project || state.editingProject || state.project?.project?.id;
-      const deliverableId = target.dataset.id || state.editing?.id;
-      if (!projectId || !deliverableId) return;
-
-      const form = document.querySelector('#edit-delivery-form');
-      if (form) {
-        await send(`/projects/${projectId}/deliverables/${deliverableId}`, {
-          ...deliveryPayload(form),
-          updated: state.editing?.updated
-        }, 'PATCH');
-      }
-
-      await send(`/projects/${projectId}/deliverables/${deliverableId}/finalize`, {});
-      closeModal();
+      const projectId = target.dataset.project;
+      const deliverableId = target.dataset.id;
+      if (document.querySelector('#edit-delivery-form')) await saveWorkstream();
+      const added = await send(`/projects/${projectId}/deliverables/${deliverableId}/save-to-documents`, {});
+      if (state.page !== 'workstream') await reloadCurrent();
+      toast(`Added to Engagement Documents: ${added.name}`);
+    } else if (action === 'move-to-final' || action === 'return-to-documents') {
+      const toFinal = action === 'move-to-final';
+      const resourceIds = toFinal ? [...document.querySelectorAll('.document-select:checked')].map(box => box.value) : [target.dataset.id];
+      if (!resourceIds.length) return;
+      await send(`/projects/${state.project.project.id}/documents/final`, { resourceIds, final: toFinal });
       await reloadCurrent();
-      toast('Moved to Final Deliverables.');
-    } else if (action === 'save-export-to-documents') {
-      event.stopPropagation();
-      const projectId = target.dataset.project || state.editingProject || state.project?.project?.id;
-      const deliverableId = target.dataset.id || state.editing?.id;
-      if (!projectId || !deliverableId) return;
-
-      const form = document.querySelector('#edit-delivery-form');
-      if (form) {
-        await send(`/projects/${projectId}/deliverables/${deliverableId}`, {
-          ...deliveryPayload(form),
-          updated: state.editing?.updated
-        }, 'PATCH');
-        const updated = await api(`/projects/${projectId}/deliverables/${deliverableId}`);
-        state.editing = updated.deliverable;
-      }
-
-      const res = await send(`/projects/${projectId}/deliverables/${deliverableId}/save-to-documents`, {});
-      await reloadCurrent();
-      toast(`Export saved to Engagement Documents: ${res.name}`);
+      toast(toFinal ? `Moved ${resourceIds.length} ${resourceIds.length === 1 ? 'document' : 'documents'} to Final Deliverables.` : 'Returned to Engagement Documents.');
     } else if (action === 'add-member') {
       addMember();
     } else if (action === 'delete-workstream') {
@@ -3420,8 +3466,13 @@ document.addEventListener('input', event => {
     state.query = event.target.value;
     renderProjectResults();
   }
+  if (event.target.closest('#edit-delivery-form') && !event.target.matches('#memo-custom-standard')) markDirty();
+  if (event.target.matches('.document-select')) {
+    const selected = document.querySelectorAll('.document-select:checked').length;
+    document.querySelector('#move-to-final-btn').hidden = !selected;
+    document.querySelector('#move-to-final-count').textContent = selected > 1 ? `(${selected})` : '';
+  }
   if (event.target.closest('.memo-editor')) {
-    markMemoDirty();
     if (event.target.matches('.memo-section-body')) autosize(event.target);
     if (event.target.matches('.memo-section-heading, .memo-section-status')) renderMemoOutline();
     if (event.target.matches('[name="memo-preface"]')) autosize(event.target);
@@ -3445,13 +3496,18 @@ document.addEventListener('invalid', event => {
   }
 }, true);
 
-// Memo Base dropdowns close when focus moves elsewhere on the page.
+// Memo Base dropdowns and the export menu close on a click elsewhere; the export menu also closes once an item is chosen.
 document.addEventListener('click', event => {
   document.querySelectorAll('.memo-multi[open]').forEach(menu => { if (!menu.contains(event.target)) menu.open = false; });
+  if (!event.target.closest('.export-menu-trigger') && (!event.target.closest('.export-menu') || event.target.closest('[role="menuitem"]'))) setExportMenu(false);
 });
 
-// Enter in the extra-standard field adds it rather than submitting the memo.
+// Escape closes the export menu; Enter in the extra-standard field adds it rather than submitting the memo.
 document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && document.querySelector('#export-menu-list:not([hidden])')) {
+    setExportMenu(false);
+    document.querySelector('.export-menu-trigger')?.focus();
+  }
   if (event.key === 'Enter' && event.target.id === 'memo-custom-standard') {
     event.preventDefault();
     addMemoStandard();
@@ -3635,15 +3691,10 @@ document.addEventListener('submit', async event => {
       else location.hash = `#project/${projectId}`;
       toast('Workstream set up. Open it from Engagement Workstreams to use the toolkit.');
     } else if (form.id === 'edit-delivery-form') {
-      await send(`/projects/${state.editingProject}/deliverables/${state.editing.id}`, {
-        ...deliveryPayload(form),
-        updated: state.editing.updated
-      }, 'PATCH');
-      const updated = await api(`/projects/${state.editingProject}/deliverables/${state.editing.id}`);
-      state.editing = updated.deliverable;
+      await saveWorkstream();
       state.busy = false;
       await reloadCurrent();
-      toast('Draft saved to Engagement Documents.');
+      toast('Draft saved. Its Markdown copy in Engagement Documents is up to date.');
     } else if (form.id === 'project-general-form') {
       await send(`/projects/${state.project.project.id}`, {
         name: values.name,

@@ -193,6 +193,10 @@ export async function createApp(options = {}) {
     db.exec('ALTER TABLE resources ADD COLUMN workstream_id TEXT DEFAULT NULL');
   }
   db.exec('CREATE INDEX IF NOT EXISTS resources_workstream ON resources(workstream_id)');
+  // Final Deliverables are documents moved out of Engagement Documents. Workstreams
+  // finalised under the earlier model are carried over as exported documents below.
+  const migrateFinalWorkstreams = !resourceColumns.has('is_final');
+  if (migrateFinalWorkstreams) db.exec('ALTER TABLE resources ADD COLUMN is_final INTEGER NOT NULL DEFAULT 0');
 
   db.prepare('INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)').run('workspace', JSON.stringify(DEFAULT_SETTINGS));
   const getSettings = () => JSON.parse(db.prepare('SELECT value FROM settings WHERE key=?').get('workspace').value);
@@ -209,6 +213,27 @@ export async function createApp(options = {}) {
     db.exec('BEGIN IMMEDIATE');
     try { const result = fn(); db.exec('COMMIT'); return result; } catch (error) { db.exec('ROLLBACK'); throw error; }
   };
+  const exportName = (title, format) => `${title.replace(/[^\p{L}\p{N} _-]/gu, '').replace(/\s+/g, ' ').trim().slice(0, 100) || 'deliverable'}.${format}`;
+  // Adds the workstream's Word (memo) or PowerPoint (deck) export to Engagement Documents.
+  const addExportDocument = (delivery, project, userId, { isFinal = 0, created = now() } = {}) => {
+    const format = delivery.kind === 'memo' ? 'docx' : 'pptx';
+    const exported = exportDocument(delivery, format, exportContext(delivery, project));
+    const id = randomUUID();
+    const name = exportName(delivery.title, format);
+    db.prepare('INSERT INTO resources (id, project_id, name, kind, size, content, text, created_by, created, workstream_id, is_final) VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(
+      id, project.id, name, 'export', exported.bytes.length, exported.bytes, delivery.body, userId, created, delivery.id, isFinal
+    );
+    return { id, name };
+  };
+  if (migrateFinalWorkstreams) {
+    transaction(() => {
+      for (const delivery of db.prepare("SELECT * FROM deliverables WHERE is_final=1 AND body<>''").all()) {
+        const project = db.prepare('SELECT * FROM projects WHERE id=?').get(delivery.project_id);
+        if (project) addExportDocument(delivery, project, delivery.created_by, { isFinal: 1, created: delivery.updated });
+      }
+      db.exec('UPDATE deliverables SET is_final=0');
+    });
+  }
   const activity = (project, user, action) => db.prepare('INSERT INTO activity VALUES (?,?,?,?,?)').run(randomUUID(), project, user, action, now());
   const getProject = (id, user) => {
     const project = db.prepare('SELECT p.*, u.name AS owner_name FROM projects p JOIN memberships m ON m.project_id=p.id LEFT JOIN users u ON u.id=p.owner_id WHERE p.id=? AND m.user_id=?').get(id, user.id);
@@ -298,13 +323,13 @@ export async function createApp(options = {}) {
         const kind = i === 1 || i === 2 ? 'deck' : 'memo';
         const params = kind === 'memo' ? { gaap: f[3], standards: [STANDARD_CATALOG[f[3]].find(s => s.startsWith(i === 0 ? 'IFRS 15 ' : 'ASC 842 '))], problem: f[4] } : { deckType: 'Proposal', area: i === 1 ? 'GAAP transition' : 'IPO', problem: f[4], ipoTrack: i === 2 ? 'Readiness' : '', currentGaap: i === 1 ? 'Other' : '', targetGaap: 'Ind AS' };
         const draft = buildDraft({ kind, title: f[0], params, project, resources: [], author: user.name });
-        const isFinalVal = i === 2 ? 1 : 0;
         const workstreamId = randomUUID();
         const createdNow = now();
-        db.prepare('INSERT INTO deliverables (id, project_id, kind, title, params, body, status, created_by, created, updated, is_final, memo) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(workstreamId, project.id, kind, f[0], JSON.stringify(params), draft.body, isFinalVal ? 'Final' : (i === 0 ? 'In review' : 'Draft'), user.id, createdNow, createdNow, isFinalVal, draft.memo ? JSON.stringify(draft.memo) : '');
+        db.prepare('INSERT INTO deliverables (id, project_id, kind, title, params, body, status, created_by, created, updated, is_final, memo) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(workstreamId, project.id, kind, f[0], JSON.stringify(params), draft.body, i === 2 ? 'Approved' : (i === 0 ? 'In review' : 'Draft'), user.id, createdNow, createdNow, 0, draft.memo ? JSON.stringify(draft.memo) : '');
         const draftBuf = Buffer.from(draft.body, 'utf8');
         db.prepare('INSERT INTO resources (id, project_id, name, kind, size, content, text, created_by, created, workstream_id) VALUES (?,?,?,?,?,?,?,?,?,?)').run(randomUUID(), project.id, `${f[0]}.md`, 'draft', draftBuf.length, draftBuf, draft.body, user.id, createdNow, workstreamId);
         activity(project.id, user.id, `Created a ${kind === 'memo' ? 'technical memo' : 'slide deck'} outline`);
+        if (i === 2) addExportDocument(db.prepare('SELECT * FROM deliverables WHERE id=?').get(workstreamId), project, user.id, { isFinal: 1 });
       }
     });
   }
@@ -398,8 +423,8 @@ export async function createApp(options = {}) {
         respond(res, 200, { projects }); return;
       }
       if (path === '/api/projects' && method === 'POST') { const input = await payload(req); const project = transaction(() => createProject(user, input)); respond(res, 201, { project }); return; }
-      if (path === '/api/deliverables' && method === 'GET') {
-        respond(res, 200, { deliverables: db.prepare('SELECT d.id,d.project_id,d.kind,d.title,d.status,d.created,d.updated,d.created_by,d.is_final,p.name AS project_name,p.client FROM deliverables d JOIN projects p ON p.id=d.project_id JOIN memberships m ON m.project_id=p.id WHERE m.user_id=? ORDER BY d.updated DESC').all(user.id) }); return;
+      if (path === '/api/final-deliverables' && method === 'GET') {
+        respond(res, 200, { documents: db.prepare('SELECT r.id,r.project_id,r.name,r.kind,r.size,r.created,r.created_by,p.name AS project_name,p.client FROM resources r JOIN projects p ON p.id=r.project_id JOIN memberships m ON m.project_id=p.id WHERE m.user_id=? AND r.is_final=1 ORDER BY r.created DESC').all(user.id) }); return;
       }
       if (path === '/api/activity' && method === 'GET') {
         respond(res, 200, { activity: db.prepare('SELECT a.*,u.name AS user_name,p.name AS project_name FROM activity a JOIN users u ON u.id=a.user_id JOIN projects p ON p.id=a.project_id JOIN memberships m ON m.project_id=p.id WHERE m.user_id=? ORDER BY a.created DESC LIMIT 100').all(user.id) }); return;
@@ -438,7 +463,7 @@ export async function createApp(options = {}) {
         if (!suffix && method === 'GET') {
           respond(res, 200, {
             project,
-            resources: db.prepare('SELECT id,name,kind,size,created,created_by,workstream_id FROM resources WHERE project_id=? ORDER BY created DESC').all(project.id),
+            resources: db.prepare('SELECT id,name,kind,size,created,created_by,workstream_id,is_final FROM resources WHERE project_id=? ORDER BY created DESC').all(project.id),
             deliverables: db.prepare('SELECT id,kind,title,status,created,updated,created_by,is_final FROM deliverables WHERE project_id=? ORDER BY updated DESC').all(project.id),
             members: db.prepare("SELECT u.id,u.name,u.email,u.designation,m.role FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.project_id=? ORDER BY CASE WHEN m.role='Engagement Manager' THEN 1 WHEN m.role='Reviewer' THEN 2 ELSE 3 END, u.name ASC").all(project.id),
             activity: db.prepare('SELECT a.*,u.name AS user_name FROM activity a JOIN users u ON u.id=a.user_id WHERE project_id=? ORDER BY created DESC LIMIT 40').all(project.id)
@@ -573,6 +598,24 @@ export async function createApp(options = {}) {
           const id = randomUUID(); const text = /\.(md|txt|csv|json)$/i.test(name) ? content.toString('utf8').slice(0, 100000) : '';
           transaction(() => { db.prepare('INSERT INTO resources (id, project_id, name, kind, size, content, text, created_by, created) VALUES (?,?,?,?,?,?,?,?,?)').run(id, project.id, name, input.kind, content.length, content, text, user.id, now()); db.prepare('UPDATE projects SET updated=? WHERE id=?').run(now(), project.id); activity(project.id, user.id, `Added resource: ${name}`); }); respond(res, 201, { id }); return;
         }
+        if (suffix === 'documents/final' && method === 'POST') {
+          const input = await payload(req);
+          requireValue(typeof input.final === 'boolean', 'Choose where the documents should go.');
+          requireValue(Array.isArray(input.resourceIds) && input.resourceIds.length >= 1 && input.resourceIds.length <= 100 && input.resourceIds.every(x => typeof x === 'string'), 'Select at least one document.');
+          const documents = [...new Set(input.resourceIds)].map(id => {
+            const document = db.prepare('SELECT id,name FROM resources WHERE id=? AND project_id=?').get(id, project.id);
+            requireValue(document, 'A selected document is outside this project or unavailable.', 403);
+            return document;
+          });
+          transaction(() => {
+            for (const document of documents) db.prepare('UPDATE resources SET is_final=? WHERE id=?').run(input.final ? 1 : 0, document.id);
+            db.prepare('UPDATE projects SET updated=? WHERE id=?').run(now(), project.id);
+            const names = documents.map(d => d.name).join(', ');
+            activity(project.id, user.id, input.final ? `Moved to Final Deliverables: ${names}` : `Returned to Engagement Documents: ${names}`);
+          });
+          respond(res, 200, { ok: true, moved: documents.length });
+          return;
+        }
         const resourceMatch = /^resources\/([\w-]+)$/.exec(suffix);
         if (resourceMatch && ['GET', 'DELETE'].includes(method)) {
           const resource = db.prepare('SELECT * FROM resources WHERE id=? AND project_id=?').get(resourceMatch[1], project.id); requireValue(resource, 'Resource not found.', 404);
@@ -658,55 +701,35 @@ export async function createApp(options = {}) {
           respond(res, 200, { ok: true, resourceId });
           return;
         }
-        const finalizeMatch = /^deliverables\/([\w-]+)\/finalize$/.exec(suffix);
-        if (finalizeMatch && method === 'POST') {
-          const delivery = db.prepare('SELECT * FROM deliverables WHERE id=? AND project_id=?').get(finalizeMatch[1], project.id);
-          requireValue(delivery, 'Deliverable not found.', 404);
-          requireValue(delivery.body.trim(), 'Open the workstream toolkit and create an outline before finalizing.', 409);
-          const updated = new Date(Math.max(Date.now(), Date.parse(delivery.updated) + 1)).toISOString();
-          transaction(() => {
-            db.prepare("UPDATE deliverables SET is_final=1, status='Final', updated=? WHERE id=? AND project_id=?").run(updated, delivery.id, project.id);
-            db.prepare('UPDATE projects SET updated=? WHERE id=?').run(updated, project.id);
-            activity(project.id, user.id, `Moved ${delivery.title} to Final Deliverables`);
-          });
-          respond(res, 200, { ok: true, is_final: 1, status: 'Final' });
-          return;
-        }
         const saveExportMatch = /^deliverables\/([\w-]+)\/save-to-documents$/.exec(suffix);
         if (saveExportMatch && method === 'POST') {
           const delivery = db.prepare('SELECT * FROM deliverables WHERE id=? AND project_id=?').get(saveExportMatch[1], project.id);
           requireValue(delivery, 'Deliverable not found.', 404);
           requireValue(delivery.body.trim(), 'Open the workstream toolkit and create an outline before exporting.', 409);
-          const input = await payload(req).catch(() => ({}));
-          const format = input.format === 'docx' || input.format === 'pptx' ? input.format : (delivery.kind === 'memo' ? 'docx' : 'pptx');
-          const exported = exportDocument(delivery, format, exportContext(delivery, project));
-          const docId = randomUUID();
-          const docName = `${delivery.title.replace(/[^\p{L}\p{N} _-]/gu, '').slice(0, 100) || 'deliverable'}.${format}`;
-          transaction(() => {
-            db.prepare('INSERT INTO resources (id, project_id, name, kind, size, content, text, created_by, created, workstream_id) VALUES (?,?,?,?,?,?,?,?,?,?)').run(
-              docId, project.id, docName, 'export', exported.bytes.length, exported.bytes, delivery.body, delivery.created_by, delivery.created, delivery.id
-            );
+          const added = transaction(() => {
+            const document = addExportDocument(delivery, project, user.id);
             db.prepare('UPDATE projects SET updated=? WHERE id=?').run(now(), project.id);
-            activity(project.id, user.id, `Added export to engagement documents: ${docName}`);
+            activity(project.id, user.id, `Added to Engagement Documents: ${document.name}`);
+            return document;
           });
-          respond(res, 201, { ok: true, id: docId, name: docName });
+          respond(res, 201, { ok: true, ...added });
           return;
         }
-        const deliveryMatch = /^deliverables\/([\w-]+)(?:\/export\/(md|docx|pptx))?$/.exec(suffix);
+        const deliveryMatch = /^deliverables\/([\w-]+)(?:\/export\/(md|pdf|docx|pptx))?$/.exec(suffix);
         if (deliveryMatch) {
           const delivery = db.prepare('SELECT * FROM deliverables WHERE id=? AND project_id=?').get(deliveryMatch[1], project.id); requireValue(delivery, 'Deliverable not found.', 404);
           if (deliveryMatch[2] && method === 'GET') {
             requireValue(delivery.body.trim(), 'Open the workstream toolkit and create an outline before exporting.', 409);
-            const format = deliveryMatch[2]; requireValue(format === 'md' || (delivery.kind === 'memo' ? format === 'docx' : format === 'pptx'), 'This format is unavailable for this deliverable.');
+            const format = deliveryMatch[2]; requireValue(format === 'md' || format === 'pdf' || (delivery.kind === 'memo' ? format === 'docx' : format === 'pptx'), 'This format is unavailable for this deliverable.');
             const exported = exportDocument(delivery, format, exportContext(delivery, project));
-            const filename = `${delivery.title.replace(/[^\p{L}\p{N} _-]/gu, '').slice(0, 100) || 'deliverable'}.${format}`;
+            const filename = exportName(delivery.title, format);
             res.writeHead(200, { ...headers, 'Content-Type': exported.mime, 'Content-Disposition': `attachment; filename="deliverable.${format}"; filename*=UTF-8''${encodeURIComponent(filename).replace(/'/g, '%27')}` }); res.end(exported.bytes); return;
           }
           if (method === 'GET' && !deliveryMatch[2]) { respond(res, 200, { deliverable: { ...delivery, params: JSON.parse(delivery.params), memo: memoOf(delivery) } }); return; }
           if (method === 'DELETE' && !deliveryMatch[2]) {
             requireValue(delivery.created_by === user.id || project.owner_id === user.id, 'Only the workstream creator or project owner may delete a workstream.', 403);
             transaction(() => {
-              db.prepare("DELETE FROM resources WHERE project_id=? AND workstream_id=? AND kind='draft'").run(project.id, delivery.id);
+              db.prepare("DELETE FROM resources WHERE project_id=? AND workstream_id=? AND kind='draft' AND is_final=0").run(project.id, delivery.id);
               db.prepare('UPDATE resources SET workstream_id=NULL WHERE project_id=? AND workstream_id=?').run(project.id, delivery.id);
               db.prepare('DELETE FROM deliverables WHERE id=? AND project_id=?').run(delivery.id, project.id);
               db.prepare('UPDATE projects SET updated=? WHERE id=?').run(now(), project.id);
@@ -725,14 +748,13 @@ export async function createApp(options = {}) {
             requireValue(body.length <= 200000, 'Content is too long.');
             requireValue(['Draft', 'In review', 'Approved', 'Final'].includes(input.status), 'Choose a valid review status.');
             requireValue(input.updated === delivery.updated, 'This draft was updated by someone else. Reopen it before saving.', 409);
-            const isFinalVal = input.is_final !== undefined ? (input.is_final ? 1 : 0) : (input.status === 'Final' ? 1 : delivery.is_final);
             const updated = new Date(Math.max(Date.now(), Date.parse(delivery.updated) + 1)).toISOString();
             transaction(() => {
-              db.prepare('UPDATE deliverables SET title=?,params=?,body=?,memo=?,status=?,updated=?,is_final=? WHERE id=? AND project_id=?').run(
-                title, JSON.stringify(params), body, memo ? JSON.stringify(memo) : '', input.status, updated, isFinalVal, delivery.id, project.id
+              db.prepare('UPDATE deliverables SET title=?,params=?,body=?,memo=?,status=?,updated=? WHERE id=? AND project_id=?').run(
+                title, JSON.stringify(params), body, memo ? JSON.stringify(memo) : '', input.status, updated, delivery.id, project.id
               );
-              // Sync corresponding draft document in resources
-              const draftDoc = db.prepare("SELECT id FROM resources WHERE workstream_id=? AND project_id=? AND kind='draft'").get(delivery.id, project.id);
+              // Keep the live Markdown draft current; a draft moved to Final Deliverables stays as it was, and a new live draft takes its place.
+              const draftDoc = db.prepare("SELECT id FROM resources WHERE workstream_id=? AND project_id=? AND kind='draft' AND is_final=0").get(delivery.id, project.id);
               const draftBytes = Buffer.from(body, 'utf8');
               if (draftDoc) {
                 db.prepare('UPDATE resources SET name=?, size=?, content=?, text=? WHERE id=?').run(
@@ -744,9 +766,9 @@ export async function createApp(options = {}) {
                 );
               }
               db.prepare('UPDATE projects SET updated=? WHERE id=?').run(updated, project.id);
-              activity(project.id, user.id, isFinalVal && !delivery.is_final ? `Moved ${title} to Final Deliverables` : `Updated ${title} · ${input.status}`);
+              if (input.status !== delivery.status || title !== delivery.title) activity(project.id, user.id, `Updated ${title} · ${input.status}`);
             });
-            respond(res, 200, { ok: true, is_final: isFinalVal });
+            respond(res, 200, { ok: true, updated });
             return;
           }
         }

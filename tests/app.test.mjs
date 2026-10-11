@@ -157,7 +157,7 @@ test('authentication, invitations, isolation, collaboration, and review workflow
     assert.equal((await admin.request(`/projects/${ownerProject}/members/${memberId}`, 'DELETE')).status, 200);
     for (const suffix of ['', `/resources/${ownerResource}`, `/deliverables/${draftId}`, `/deliverables/${draftId}/export/md`]) assert.equal((await member.request(`/projects/${ownerProject}${suffix}`)).status, 404);
     assert.equal((await member.request('/projects')).body.projects.length, 1);
-    assert.equal((await member.request('/deliverables')).body.deliverables.length, 0);
+    assert.equal((await member.request('/final-deliverables')).body.documents.length, 0);
     assert.ok((await member.request('/activity')).body.activity.every(a => a.project_id === memberProject));
   });
   await t.test('disabled accounts lose existing sessions and cannot sign in', async () => {
@@ -588,47 +588,49 @@ test('workstream draft file only gets added to engagement documents and inherits
   assert.equal(saveExportRes.status, 201);
   assert.ok(saveExportRes.body.name.endsWith('.docx'));
 
-  // Check resources has export document, and deliverable is still not final
+  // The Word document is added to Engagement Documents, not to Final Deliverables
   const afterExportData = await usr.request(`/projects/${projectId}`);
   const exportDoc = afterExportData.body.resources.find(r => r.kind === 'export' && r.workstream_id === deliverableId);
   assert.ok(exportDoc, 'Export file must be added to engagement documents');
+  assert.equal(exportDoc.id, saveExportRes.body.id);
   assert.equal(exportDoc.created_by, deliv.created_by);
-  assert.equal(afterExportData.body.deliverables.find(d => d.id === deliverableId).is_final, 0);
+  assert.equal(exportDoc.is_final, 0);
+  assert.equal((await usr.request(`/projects/${projectId}/deliverables/${deliverableId}/finalize`, 'POST')).status, 404, 'Workstreams are no longer finalised');
 
-  // Finalize deliverable (explicit "Move to Final Deliverables")
-  const finalizeRes = await usr.request(`/projects/${projectId}/deliverables/${deliverableId}/finalize`, 'POST');
-  assert.equal(finalizeRes.status, 200);
-  assert.equal(finalizeRes.body.is_final, 1);
-  assert.equal(finalizeRes.body.status, 'Final');
+  // Selected documents move to Final Deliverables and can be returned
+  const finalPath = `/projects/${projectId}/documents/final`;
+  assert.equal((await usr.request(finalPath, 'POST', { resourceIds: [], final: true })).status, 400);
+  assert.equal((await usr.request(finalPath, 'POST', { resourceIds: ['not-a-document'], final: true })).status, 403);
+  assert.equal((await usr.request(finalPath, 'POST', { resourceIds: [exportDoc.id, draftDoc.id], final: true })).status, 200);
+  const finalProjectData = (await usr.request(`/projects/${projectId}`)).body;
+  assert.deepEqual(finalProjectData.resources.filter(r => r.is_final).map(r => r.id).sort(), [exportDoc.id, draftDoc.id].sort());
+  assert.ok((await usr.request('/final-deliverables')).body.documents.some(d => d.id === exportDoc.id && d.project_name === 'Technical Memo Project'));
+  assert.ok(finalProjectData.activity.some(a => a.action.startsWith('Moved to Final Deliverables: ')));
 
-  // Confirm it is now marked final in project deliverables
-  const finalProjectData = await usr.request(`/projects/${projectId}`);
-  const finalizedDeliv = finalProjectData.body.deliverables.find(d => d.id === deliverableId);
-  assert.equal(finalizedDeliv.is_final, 1);
-  assert.equal(finalizedDeliv.status, 'Final');
+  // A draft moved to Final Deliverables is a snapshot; the next save starts a new live draft
+  const workstream = (await usr.request(`/projects/${projectId}/deliverables/${deliverableId}`)).body.deliverable;
+  assert.equal((await usr.request(`/projects/${projectId}/deliverables/${deliverableId}`, 'PATCH', { title: workstream.title, status: 'Draft', body: workstream.body + '\nLater edit.', updated: workstream.updated })).status, 200);
+  const afterEdit = (await usr.request(`/projects/${projectId}`)).body.resources;
+  const drafts = afterEdit.filter(r => r.kind === 'draft' && r.workstream_id === deliverableId);
+  assert.equal(drafts.length, 2);
+  assert.match(Buffer.from((await usr.request(`/projects/${projectId}/resources/${draftDoc.id}`)).body).toString(), /^(?![\s\S]*Later edit)/);
+  assert.match(Buffer.from((await usr.request(`/projects/${projectId}/resources/${drafts.find(r => !r.is_final).id}`)).body).toString(), /Later edit\.$/);
+
+  assert.equal((await usr.request(finalPath, 'POST', { resourceIds: [exportDoc.id], final: false })).status, 200);
+  assert.equal((await usr.request(`/projects/${projectId}`)).body.resources.find(r => r.id === exportDoc.id).is_final, 0);
 
   // Verify UI code behavior and bindings
   const appJs = await readFile(resolve('public/app.js'), 'utf8');
   const stylesCss = await readFile(resolve('public/styles.css'), 'utf8');
 
-  // Verify sidebar counts only final deliverables
-  assert.match(appJs, /finalDeliverablesCount\s*=\s*isProject\s*\?\s*\(projectData\.deliverables\?\.filter\(d\s*=>\s*Boolean\(d\.is_final\)\)\?\.length/);
+  // Sidebar counts final documents; the toolkit adds documents and the dashboard moves them
+  assert.match(appJs, /finalDeliverablesCount = isProject \? \(projectData\.resources\?\.filter\(r => r\.is_final\)/);
   assert.match(appJs, /projectTabNav\('deliverables',\s*'Final Deliverables',\s*'slides',\s*finalDeliverablesCount\)/);
-
-  // Verify deliverables tab filters to is_final
-  assert.match(appJs, /finalDeliverables\s*=\s*\(data\.deliverables\s*\|\|\s*\[\]\)\.filter\(d\s*=>\s*Boolean\(d\.is_final\)\)/);
-
-  // Verify Move to Final button in workstream table row and editor modal
-  assert.match(appJs, /data-action="promote-to-final"/);
-  assert.match(appJs, /Move to Final Deliverables/);
-
-  // Verify Save to Documents button in editor toolbar
-  assert.match(appJs, /data-action="save-export-to-documents"/);
-  assert.match(appJs, /Save \$\{d\.kind === 'memo' \? 'Word \(\.docx\)' : 'Deck \(\.pptx\)'\} to Documents/);
-
-  // Verify CSS styles for action buttons and chips
-  assert.match(stylesCss, /\.move-final-action-btn\s*\{/);
-  assert.match(stylesCss, /\.final-chip\s*\{/);
+  assert.match(appJs, /data-action="add-to-documents"[\s\S]*?Add to Engagement Documents/);
+  assert.match(appJs, /data-action="move-to-final"/);
+  assert.doesNotMatch(appJs, /Drafts & exports stay in Engagement Documents/);
+  assert.match(stylesCss, /\.document-select\s*\{/);
+  assert.match(stylesCss, /\.draft-status\s*\{/);
 });
 
 test('workstream setup saves intake separately from toolkit generation', async t => {
@@ -652,14 +654,12 @@ test('workstream setup saves intake separately from toolkit generation', async t
       const setup = (await owner.request(workstreamPath)).body.deliverable;
       assert.equal(setup.status, 'Setup');
       assert.equal(setup.body, '');
-      assert.equal(setup.is_final, 0);
       assert.equal(setup.params.problem, params.problem);
       assert.deepEqual(setup.params.resourceIds, [evidenceId]);
       const projectBefore = (await owner.request(`/projects/${projectId}`)).body;
       assert.equal(projectBefore.deliverables.length, 1);
       assert.equal(projectBefore.resources.length, 1, 'Setup must not generate a draft document');
       assert.equal((await owner.request(workstreamPath + '/export/md')).status, 409);
-      assert.equal((await owner.request(workstreamPath + '/finalize', 'POST', {})).status, 409);
       assert.equal((await owner.request(workstreamPath + '/save-to-documents', 'POST', {})).status, 409);
       assert.equal((await outsider.request(workstreamPath + '/generate', 'POST', { updated: setup.updated })).status, 404);
       assert.equal((await owner.request(workstreamPath + '/generate', 'POST', { updated: 'stale' })).status, 409);
@@ -687,7 +687,7 @@ test('workstream setup saves intake separately from toolkit generation', async t
       assert.equal((await owner.request(workstreamPath + '/generate', 'POST', { updated: edited.updated })).status, 409);
       assert.equal((await owner.request(workstreamPath)).body.deliverable.body, editedBody);
       assert.equal((await owner.request(workstreamPath + `/export/${kind === 'memo' ? 'docx' : 'pptx'}`)).status, 200);
-      assert.equal((await owner.request(workstreamPath + '/finalize', 'POST', {})).status, 200);
+      assert.equal((await owner.request(workstreamPath + '/save-to-documents', 'POST', {})).status, 201);
     });
   }
 
@@ -754,12 +754,15 @@ test('workstream deletion enforces ownership and preserves evidence and saved ex
     assert.ok(project.activity.some(a => a.action === 'Deleted workstream: Revenue <review> & memo'));
   });
 
-  await t.test('the owner can delete another creator’s final workstream, and setup deletion leaves documents intact', async () => {
+  await t.test('the owner can delete another creator’s workstream; final documents and setup deletion leave documents intact', async () => {
     const final = (await creator.request(`/projects/${projectId}/deliverables`, 'POST', memoInput([]))).body;
     const finalPath = `/projects/${projectId}/deliverables/${final.id}`;
-    assert.equal((await creator.request(finalPath + '/finalize', 'POST', {})).status, 200);
+    const finalDraft = (await owner.request(`/projects/${projectId}`)).body.resources.find(r => r.workstream_id === final.id && r.kind === 'draft');
+    assert.equal((await creator.request(`/projects/${projectId}/documents/final`, 'POST', { resourceIds: [finalDraft.id], final: true })).status, 200);
     assert.equal((await owner.request(finalPath, 'DELETE')).status, 200);
-    assert.equal((await owner.request(`/projects/${projectId}/resources/${final.resourceId}`)).status, 404);
+    assert.equal((await owner.request(`/projects/${projectId}/resources/${finalDraft.id}`)).status, 200, 'A draft in Final Deliverables outlives its workstream');
+    assert.equal((await owner.request(`/projects/${projectId}/documents/final`, 'POST', { resourceIds: [finalDraft.id], final: false })).status, 200);
+    assert.equal((await owner.request(`/projects/${projectId}/resources/${finalDraft.id}`, 'DELETE')).status, 200);
     const setup = (await creator.request(`/projects/${projectId}/workstreams`, 'POST', memoInput([]))).body;
     assert.equal((await creator.request(`/projects/${projectId}/deliverables/${setup.id}`, 'DELETE')).status, 200);
     const project = (await owner.request(`/projects/${projectId}`)).body;
@@ -806,6 +809,35 @@ test('older databases upgrade before workstream indexes are created and preserve
 
 
 
+
+test('workstreams finalised before Final Deliverables held documents become final documents once', async () => {
+  const dir = await mkdtemp(resolve('test-results', 'final-migration-'));
+  let migrated;
+  try {
+    const first = await createApp({ dataDir: dir });
+    const timestamp = '2026-10-01T00:00:00.000Z';
+    first.db.prepare('INSERT INTO projects (id, name, client, fy, type, gaap, created, updated) VALUES (?,?,?,?,?,?,?,?)').run('legacy-project', 'Legacy', 'Alias', '2027-03-31', 'Technical memo', 'IFRS', timestamp, timestamp);
+    const insert = first.db.prepare('INSERT INTO deliverables (id, project_id, kind, title, params, body, status, created, updated, is_final) VALUES (?,?,?,?,?,?,?,?,?,?)');
+    insert.run('final-memo', 'legacy-project', 'memo', 'Final memo', '{"gaap":"IFRS"}', '# Final memo\n\n## Conclusion\n\nAgreed.', 'Final', timestamp, timestamp, 1);
+    insert.run('final-setup', 'legacy-project', 'deck', 'Empty setup', '{}', '', 'Final', timestamp, timestamp, 1);
+    insert.run('open-memo', 'legacy-project', 'memo', 'Open memo', '{"gaap":"IFRS"}', '# Open memo', 'Draft', timestamp, timestamp, 0);
+    // Recreate the earlier schema, where documents had no final flag.
+    first.db.exec('ALTER TABLE resources DROP COLUMN is_final');
+    await first.close();
+
+    migrated = await createApp({ dataDir: dir });
+    const finals = migrated.db.prepare('SELECT * FROM resources WHERE is_final=1').all();
+    assert.deepEqual(finals.map(r => [r.name, r.kind, r.workstream_id, r.created]), [['Final memo.docx', 'export', 'final-memo', timestamp]]);
+    assert.match(unzipStored(Buffer.from(finals[0].content)).get('word/document.xml'), /Agreed\./);
+    assert.equal(migrated.db.prepare('SELECT COUNT(*) AS count FROM deliverables WHERE is_final=1').get().count, 0);
+    await migrated.close();
+    migrated = await createApp({ dataDir: dir });
+    assert.equal(migrated.db.prepare('SELECT COUNT(*) AS count FROM resources').get().count, 1, 'Migration runs once');
+  } finally {
+    if (migrated) await migrated.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test('memo builder stores ordered sections, composes the Markdown body, and exports a structured memo', async () => {
   const owner = client();
@@ -884,6 +916,9 @@ test('memo builder stores ordered sections, composes the Markdown body, and expo
   assert.match(docx, /Engagement Partner/);
   assert.match(docx, /Review and sign-off/);
   assert.equal((docx.match(/<w:tbl>/g) || []).length, 2, 'Cover block and sign-off are tables');
+  const pdfResponse = await owner.request(path + '/export/pdf');
+  assert.equal(pdfResponse.status, 200);
+  assert.equal(Buffer.from(pdfResponse.body).subarray(0, 5).toString(), '%PDF-');
 
   // A plain Markdown save stays canonical and the sections are recovered from it.
   const markdownBody = latest.body.replace('Scope <confirmed> & agreed.', 'Scope revised in Markdown.');
@@ -912,4 +947,20 @@ test('legacy memos drop generated evidence and checklist sections but keep writt
   assert.equal(memo.header.to, 'CFO');
   assert.equal(memo.signoff.preparer, 'Analyst');
   assert.deepEqual(Object.values(memo.completion), [false, false, false, false]);
+});
+
+test('PDF export is a well-formed multi-page document with WinAnsi text', () => {
+  const lines = Array.from({ length: 120 }, (_, i) => `- Point ${i + 1} — détail · “quoted” text that is long enough to need wrapping across the printable width of an A4 page.`);
+  const { mime, bytes } = exportDocument({ title: 'Lease memo', body: ['# Lease memo', '', '## Analysis', ...lines, '### Sub-point', 'Closing paragraph 漢字.'].join('\n') }, 'pdf');
+  assert.equal(mime, 'application/pdf');
+  const text = bytes.toString('latin1');
+  assert.ok(text.startsWith('%PDF-1.4\n') && text.endsWith('%%EOF\n'));
+  const count = Number(/\/Count (\d+)/.exec(text)[1]);
+  assert.ok(count >= 3, 'Long content flows onto further pages');
+  assert.match(text, new RegExp(`Page ${count} of ${count}`.split('').map(c => c.charCodeAt(0).toString(16).padStart(2, '0')).join('')));
+  // Every cross-reference offset must point at the start of its object.
+  const xrefAt = Number(/startxref\n(\d+)/.exec(text)[1]);
+  const entries = text.slice(xrefAt).split('\n').filter(line => / 00000 n $/.test(line));
+  entries.forEach((entry, i) => assert.ok(text.startsWith(`${i + 1} 0 obj`, Number(entry.slice(0, 10)))));
+  assert.ok(text.includes('<506f696e74203120972064e974'), 'Em dash and accents map to WinAnsi bytes ("Point 1 — dé")');
 });

@@ -55,8 +55,9 @@ Advisory Desk follows a structured, role-aware workflow:
 ### 4. In-Engagement Workstation (`#project/:id`)
 All core advisory tools and deliverables sit exclusively inside each engagement:
 - **Workstream Setup**: Select **New**, choose Memo Builder or Slide Decks, and enter the setup fields. **Setup Workflow** saves the workstream and returns to the engagement dashboard without generating an outline or adding a draft document.
-- **Standalone Toolkits**: Open a saved workstream to enter its dedicated toolkit page. Create the memo or deck outline there, then edit, review, and export it. Draft documents are added to Engagement Documents only when the outline is created.
-- **Workstream Actions**: Each dashboard row has a three-dot menu for opening its toolkit, moving a draft to Final Deliverables, or deleting it. Only the creator or engagement owner can delete a workstream. Deletion requires confirmation and removes its draft while retaining saved exports and reference documents.
+- **Standalone Toolkits**: Open a saved workstream to enter its dedicated toolkit page. Create the memo or deck outline there, then edit, review, and export it. Creating the outline adds the workstream's Markdown draft to Engagement Documents. Edits autosave a moment after you stop typing, and every save updates that draft. **Add to Engagement Documents** creates the Word (`.docx`) memo or PowerPoint (`.pptx`) deck from the latest edits whenever you choose.
+- **Document Flow**: Every document (uploads, workstream drafts, and added Word or PowerPoint files) starts in **Engagement Documents**. Select documents there and choose **Move to Final Deliverables**. Final Deliverables can return a document to Engagement Documents. A Markdown draft moved to Final Deliverables is kept as it was, and the workstream starts a new live draft on its next save.
+- **Workstream Actions**: Each dashboard row has a three-dot menu for opening its toolkit, adding its document to Engagement Documents, or deleting it. Only the creator or engagement owner can delete a workstream. Deletion requires confirmation and removes its live draft while keeping added documents, reference documents, and anything in Final Deliverables.
 - **Technical Accounting Memos (Memo Builder)**: The toolkit runs in three stages, saved together:
   1. **Memo Base**: the preface (To / From / CC / Date and an opening note), the accounting framework (**IFRS**, **Ind AS**, or **US GAAP**) with a dropdown of every standard issued under it, and the engagement documents the memo relies on. These documents will be the source material for the future AI drafting agent.
   2. **Builder**: ordered sections following a standard technical memorandum structure (executive summary, purpose and scope, background, issues, authoritative guidance, analysis, conclusion, financial statement impact, disclosure, internal controls). Each section has drafting guidance and a status (*Not started* → *Drafting* → *Ready for review*). An outline rail tracks progress. You can add, rename, reorder, collapse, or remove sections, and open a full-memo preview with one click.
@@ -90,6 +91,9 @@ The application generates fully editable Office documents directly in pure Node.
 - **Word (`.docx`)**: Memos export as a structured memorandum: a cover table (addressees, date, subject, client, period, framework, status), numbered section headings, bullet points, and a Role / Name / Signature / Date sign-off table.
 - **PowerPoint (`.pptx`)**: Slide decks export as native 16:9 widescreen presentation files with formatted title slides and slide content layouts.
 - **Markdown (`.md`)**: Direct plain-text export for version control and documentation workflows.
+- **PDF (`.pdf`)**: Memos and decks export as paginated A4 documents with headings, bullets, and a page-numbered footer, generated without external tools.
+
+In a toolkit, every format sits in the **Export** menu (the download icon at the right of the toolbar).
 
 Exports always reflect the latest saved draft version in the database.
 
