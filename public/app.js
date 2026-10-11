@@ -517,6 +517,8 @@ function setSession(data) {
   state.csrf = data.csrf;
   state.workspace = data.workspace;
   state.standards = data.standards;
+  state.memoGuide = data.memoGuide || [];
+  state.sectionStatuses = data.sectionStatuses || ['Not started', 'Drafting', 'Ready for review'];
 }
 
 async function boot() {
@@ -2490,6 +2492,175 @@ function slidePreview(body) {
   }).join('') || markdown(body);
 }
 
+/* Memo Builder: the memo is edited as ordered sections and saved as one structure.
+   The DOM is the working copy; collectMemo() reads it back for saving and preview. */
+const MEMO_MAX_SECTIONS = 40;
+const memoStatusClass = status => status === 'Ready for review' ? 'memo-status-ready' : status === 'Drafting' ? 'memo-status-drafting' : 'memo-status-empty';
+
+function memoHint(heading) {
+  const key = heading.toLowerCase().replace(/^\d+(\.\d+)*\.?\s+/, '').trim();
+  return state.memoGuide.find(g => g.heading.toLowerCase() === key || g.aliases.includes(key))?.hint || '';
+}
+
+function memoSectionCard(section, index) {
+  const hint = memoHint(section.heading);
+  return `
+    <section class="memo-section ${memoStatusClass(section.status)}" id="memo-section-${e(section.id)}" data-section-id="${e(section.id)}">
+      <header class="memo-section-head">
+        ${button(icon('chevron'), 'memo-toggle-section', 'icon-btn memo-collapse-btn', 'title="Collapse section" aria-label="Collapse section" aria-expanded="true"')}
+        <span class="memo-section-num">${index + 1}</span>
+        <input class="memo-section-heading" value="${e(section.heading)}" aria-label="Section heading" required maxlength="160">
+        <select class="memo-section-status" aria-label="Section status">${options(state.sectionStatuses, section.status)}</select>
+        <div class="memo-section-tools">
+          ${button(icon('down', 'icon-flip'), 'memo-move-section', 'icon-btn', 'data-dir="-1" title="Move up" aria-label="Move section up"')}
+          ${button(icon('down'), 'memo-move-section', 'icon-btn', 'data-dir="1" title="Move down" aria-label="Move section down"')}
+          ${button(icon('trash'), 'memo-delete-section', 'icon-btn subtle-danger', 'title="Delete section" aria-label="Delete section"')}
+        </div>
+      </header>
+      <div class="memo-section-content">
+        ${hint ? `<p class="memo-section-hint">${icon('info')}<span>${e(hint)}</span></p>` : ''}
+        <textarea class="memo-section-body" rows="4" maxlength="30000" spellcheck="true" aria-label="${e(section.heading)} content" placeholder="Write in Markdown. Use - for bullets and ### for sub-headings.">${e(section.body)}</textarea>
+      </div>
+    </section>
+  `;
+}
+
+function memoEditorLayout(memo) {
+  const { header, signoff, sections } = memo;
+  const field = (label, name, value, type = 'text') => `<label>${label}<input name="memo-${name}" type="${type}" value="${e(value || '')}" maxlength="200"></label>`;
+  return `
+    <div class="memo-layout">
+      <aside class="memo-outline" aria-label="Memo outline">
+        <div class="memo-progress">
+          <div class="memo-progress-label"><strong id="memo-progress-count"></strong><span>ready for review</span></div>
+          <div class="memo-progress-bar" aria-hidden="true"><span class="memo-progress-ready"></span><span class="memo-progress-drafting"></span></div>
+        </div>
+        <ol class="memo-outline-list" id="memo-outline-list"></ol>
+        ${button(icon('plus') + ' Add section', 'memo-add-section', 'btn secondary small-btn memo-add-btn')}
+      </aside>
+      <div class="memo-main">
+        <details class="memo-details" ${header.to ? '' : 'open'}>
+          <summary>${icon('mail')}<span>Memo details</span><small>Addressees, date, and sign-off</small></summary>
+          <div class="memo-details-grid">
+            ${field('To', 'to', header.to)}
+            ${field('From', 'from', header.from)}
+            ${field('CC', 'cc', header.cc)}
+            ${field('Date', 'date', header.date, 'date')}
+            ${field('Prepared by', 'preparer', signoff.preparer)}
+            ${field('Reviewed by', 'reviewer', signoff.reviewer)}
+            ${field('Approved by', 'approver', signoff.approver)}
+          </div>
+        </details>
+        <div id="memo-sections">${sections.map(memoSectionCard).join('')}</div>
+        <div id="memo-preview" class="draft-preview memo-preview" hidden></div>
+      </div>
+    </div>
+  `;
+}
+
+function collectMemo(form) {
+  const field = name => form.querySelector(`[name="memo-${name}"]`)?.value.trim() || '';
+  return {
+    header: { to: field('to'), from: field('from'), cc: field('cc'), date: field('date') },
+    signoff: { preparer: field('preparer'), reviewer: field('reviewer'), approver: field('approver') },
+    sections: [...form.querySelectorAll('.memo-section')].map(card => ({
+      id: card.dataset.sectionId,
+      heading: card.querySelector('.memo-section-heading').value.trim(),
+      body: card.querySelector('.memo-section-body').value,
+      status: card.querySelector('.memo-section-status').value
+    }))
+  };
+}
+
+// Save payload for the workstream editor form, whichever toolkit rendered it.
+function deliveryPayload(form) {
+  const values = Object.fromEntries(new FormData(form));
+  if (form.dataset.kind !== 'memo') return { title: values.title, status: values.status, body: values.body };
+  return { title: values.title, status: values.status, memo: collectMemo(form) };
+}
+
+function renderMemoOutline() {
+  const list = document.querySelector('#memo-outline-list');
+  if (!list) return;
+  const cards = [...document.querySelectorAll('.memo-section')];
+  const statusOf = card => card.querySelector('.memo-section-status').value;
+  list.innerHTML = cards.map((card, i) => {
+    const heading = card.querySelector('.memo-section-heading').value.trim() || 'Untitled section';
+    card.querySelector('.memo-section-num').textContent = i + 1;
+    card.className = `memo-section ${memoStatusClass(statusOf(card))}${card.classList.contains('collapsed') ? ' collapsed' : ''}`;
+    card.querySelector('[data-dir="-1"]').disabled = i === 0;
+    card.querySelector('[data-dir="1"]').disabled = i === cards.length - 1;
+    card.querySelector('[data-action="memo-delete-section"]').disabled = cards.length === 1;
+    return `<li><button type="button" class="memo-outline-item ${memoStatusClass(statusOf(card))}" data-action="memo-jump" data-id="${e(card.dataset.sectionId)}" title="${e(statusOf(card))}"><span class="memo-outline-dot"></span><span class="memo-outline-num">${i + 1}</span><span class="memo-outline-text">${e(heading)}</span></button></li>`;
+  }).join('');
+  const ready = cards.filter(card => statusOf(card) === 'Ready for review').length;
+  const drafting = cards.filter(card => statusOf(card) === 'Drafting').length;
+  document.querySelector('#memo-progress-count').textContent = `${ready} of ${cards.length}`;
+  document.querySelector('.memo-progress-ready').style.width = `${cards.length ? ready / cards.length * 100 : 0}%`;
+  document.querySelector('.memo-progress-drafting').style.width = `${cards.length ? drafting / cards.length * 100 : 0}%`;
+  document.querySelector('[data-action="memo-add-section"]').disabled = cards.length >= MEMO_MAX_SECTIONS;
+}
+
+function autosize(textarea) {
+  textarea.style.height = 'auto';
+  textarea.style.height = `${textarea.scrollHeight + 2}px`;
+}
+
+function markMemoDirty() {
+  const form = document.querySelector('#edit-delivery-form[data-kind="memo"]');
+  if (!form) return;
+  form.dataset.dirty = 'true';
+  document.querySelector('#memo-dirty')?.removeAttribute('hidden');
+}
+
+function showMemoView(view) {
+  const form = document.querySelector('#edit-delivery-form');
+  const preview = document.querySelector('#memo-preview');
+  if (!form || !preview) return;
+  if (view === 'preview') {
+    const memo = collectMemo(form);
+    const header = [['To', memo.header.to], ['From', memo.header.from], ['CC', memo.header.cc], ['Date', memo.header.date]].filter(([, v]) => v).map(([k, v]) => `${k}: ${v}`);
+    const body = [`# ${form.querySelector('[name="title"]').value}`, ...header,
+      ...memo.sections.map((s, i) => `## ${i + 1}. ${s.heading || 'Untitled section'}\n${s.body.trim() || '[To be completed]'}`),
+      `## ${memo.sections.length + 1}. Review and sign-off\n- Prepared by: ${memo.signoff.preparer || '[Pending]'}\n- Reviewed by: ${memo.signoff.reviewer || '[Pending]'}\n- Approved by: ${memo.signoff.approver || '[Pending]'}`].join('\n');
+    preview.innerHTML = markdown(body);
+  }
+  preview.hidden = view !== 'preview';
+  document.querySelector('#memo-sections').hidden = view === 'preview';
+  document.querySelector('.memo-details').hidden = view === 'preview';
+  document.querySelectorAll('[data-action="memo-view"]').forEach(b => {
+    b.classList.toggle('selected', b.dataset.view === view);
+    b.setAttribute('aria-pressed', String(b.dataset.view === view));
+  });
+}
+
+function addMemoSection() {
+  const container = document.querySelector('#memo-sections');
+  if (!container || container.children.length >= MEMO_MAX_SECTIONS) return;
+  showMemoView('sections');
+  const id = crypto.randomUUID().slice(0, 8);
+  container.insertAdjacentHTML('beforeend', memoSectionCard({ id, heading: 'New section', body: '', status: state.sectionStatuses[0] }, container.children.length));
+  const card = container.lastElementChild;
+  autosize(card.querySelector('.memo-section-body'));
+  renderMemoOutline();
+  markMemoDirty();
+  card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  const heading = card.querySelector('.memo-section-heading');
+  heading.focus({ preventScroll: true });
+  heading.select();
+}
+
+function removeMemoSection(id) {
+  document.querySelector(`.memo-section[data-section-id="${CSS.escape(id)}"]`)?.remove();
+  renderMemoOutline();
+  markMemoDirty();
+}
+
+function initMemoEditor() {
+  document.querySelectorAll('.memo-section-body').forEach(autosize);
+  renderMemoOutline();
+}
+
 async function editDelivery(project, id) {
   location.hash = `#project/${project}/workstream/${id}`;
 }
@@ -2507,6 +2678,7 @@ async function renderWorkstream(project, id) {
   const params = d.params;
   const toolkit = d.kind === 'memo' ? 'Memo Builder' : 'Slide Decks';
   const pending = !d.body.trim();
+  const isMemo = d.kind === 'memo' && Boolean(d.memo);
   const evidence = (params.resourceIds || []).map(resourceId => projectData.resources.find(r => r.id === resourceId));
   const details = d.kind === 'memo'
     ? [['Accounting framework', params.gaap], ['Selected standards', params.standards.join(' · ') || 'No standards selected']]
@@ -2531,7 +2703,7 @@ async function renderWorkstream(project, id) {
       </div>
     </section>
   ` : `
-      <form id="edit-delivery-form">
+      <form id="edit-delivery-form" class="${isMemo ? 'memo-editor' : ''}" data-kind="${d.kind}">
         <div class="editor-meta">
           <label>Title
             <input name="title" value="${e(d.title)}" required maxlength="160">
@@ -2542,7 +2714,12 @@ async function renderWorkstream(project, id) {
         </div>
 
         <div class="editor-toolbar">
-          <span>${icon(d.kind === 'memo' ? 'file' : 'slides')} ${d.kind === 'memo' ? 'Technical Memorandum' : 'Executive Presentation'} · Live Markdown Preview</span>
+          ${isMemo ? `
+            <div class="view-toggle memo-view-toggle" role="group" aria-label="Memo view">
+              ${button(icon('list') + ' Sections', 'memo-view', 'icon-btn selected', 'data-view="sections" aria-pressed="true"')}
+              ${button(icon('eye') + ' Preview', 'memo-view', 'icon-btn', 'data-view="preview" aria-pressed="false"')}
+            </div>
+          ` : `<span>${icon('slides')} Executive Presentation · Live Markdown Preview</span>`}
           <div class="button-row">
             <button type="button" class="btn secondary small-btn" data-action="save-export-to-documents" data-project="${project}" data-id="${id}" title="Save ${d.kind === 'memo' ? '.docx' : '.pptx'} export directly to Engagement Documents">
               ${icon('upload')} Save ${d.kind === 'memo' ? 'Word (.docx)' : 'Deck (.pptx)'} to Documents
@@ -2554,19 +2731,22 @@ async function renderWorkstream(project, id) {
           </div>
         </div>
 
+        ${isMemo ? memoEditorLayout(d.memo) : `
         <div class="editor-grid">
           <label class="editor-input-label">
             <span class="sr-only">Deliverable content</span>
             <textarea id="draft-body" name="body" spellcheck="true" required maxlength="200000">${e(d.body)}</textarea>
           </label>
-          <div class="draft-preview ${d.kind === 'deck' ? 'deck-preview' : ''}" id="draft-preview">
-            ${d.kind === 'deck' ? slidePreview(d.body) : markdown(d.body)}
+          <div class="draft-preview deck-preview" id="draft-preview">
+            ${slidePreview(d.body)}
           </div>
         </div>
+        `}
 
         <div class="form-error" role="alert"></div>
         <div class="modal-actions">
           <span style="font-size:11.5px;color:var(--text-muted);margin-right:auto;">Drafts & exports stay in Engagement Documents until moved to Final Deliverables.</span>
+          ${isMemo ? '<span id="memo-dirty" class="memo-dirty" hidden>Unsaved changes</span>' : ''}
           <a href="#project/${project}" class="btn secondary">Back to engagement</a>
           <button type="submit" class="btn secondary">Save draft ${icon('check')}</button>
           ${!d.is_final ? `
@@ -2596,6 +2776,7 @@ async function renderWorkstream(project, id) {
       ${content}
     </div>
   `, 'Engagement Manager', `${p.name} / ${toolkit}`);
+  if (isMemo && !pending) initMemoEditor();
 }
 
 function addMember() {
@@ -2907,6 +3088,43 @@ document.addEventListener('click', async event => {
           target.textContent = state.editing.kind === 'memo' ? 'Create memo outline' : 'Create deck outline';
         }
       }
+    } else if (action === 'memo-view') {
+      showMemoView(target.dataset.view);
+    } else if (action === 'memo-add-section') {
+      addMemoSection();
+    } else if (action === 'memo-move-section') {
+      const card = target.closest('.memo-section');
+      const sibling = target.dataset.dir === '-1' ? card.previousElementSibling : card.nextElementSibling;
+      if (!sibling) return;
+      if (target.dataset.dir === '-1') sibling.before(card); else sibling.after(card);
+      renderMemoOutline();
+      markMemoDirty();
+      card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      (target.disabled ? card.querySelector('.memo-section-heading') : target).focus({ preventScroll: true });
+    } else if (action === 'memo-toggle-section') {
+      const card = target.closest('.memo-section');
+      const collapsed = card.classList.toggle('collapsed');
+      if (!collapsed) autosize(card.querySelector('.memo-section-body'));
+      target.setAttribute('aria-expanded', String(!collapsed));
+      target.setAttribute('aria-label', collapsed ? 'Expand section' : 'Collapse section');
+      target.title = collapsed ? 'Expand section' : 'Collapse section';
+    } else if (action === 'memo-delete-section') {
+      const card = target.closest('.memo-section');
+      if (!card.querySelector('.memo-section-body').value.trim()) {
+        removeMemoSection(card.dataset.sectionId);
+        return;
+      }
+      const heading = card.querySelector('.memo-section-heading').value.trim() || 'Untitled section';
+      confirmAction('Delete this section?', `"${heading}" and its content will be removed from the memo when you save the draft.`, 'delete-memo-section-form', `data-id="${e(card.dataset.sectionId)}"`);
+    } else if (action === 'memo-jump') {
+      showMemoView('sections');
+      const card = document.querySelector(`.memo-section[data-section-id="${CSS.escape(target.dataset.id)}"]`);
+      if (!card) return;
+      card.classList.remove('collapsed');
+      card.querySelector('.memo-collapse-btn')?.setAttribute('aria-expanded', 'true');
+      autosize(card.querySelector('.memo-section-body'));
+      card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      card.querySelector('.memo-section-body').focus({ preventScroll: true });
     } else if (action === 'promote-to-final') {
       event.stopPropagation();
       const projectId = target.dataset.project || state.editingProject || state.project?.project?.id;
@@ -2915,10 +3133,8 @@ document.addEventListener('click', async event => {
 
       const form = document.querySelector('#edit-delivery-form');
       if (form) {
-        const formData = new FormData(form);
-        const formValues = Object.fromEntries(formData);
         await send(`/projects/${projectId}/deliverables/${deliverableId}`, {
-          ...formValues,
+          ...deliveryPayload(form),
           updated: state.editing?.updated
         }, 'PATCH');
       }
@@ -2935,10 +3151,8 @@ document.addEventListener('click', async event => {
 
       const form = document.querySelector('#edit-delivery-form');
       if (form) {
-        const formData = new FormData(form);
-        const formValues = Object.fromEntries(formData);
         await send(`/projects/${projectId}/deliverables/${deliverableId}`, {
-          ...formValues,
+          ...deliveryPayload(form),
           updated: state.editing?.updated
         }, 'PATCH');
         const updated = await api(`/projects/${projectId}/deliverables/${deliverableId}`);
@@ -2998,12 +3212,29 @@ document.addEventListener('input', event => {
     state.query = event.target.value;
     renderProjectResults();
   }
+  if (event.target.closest('.memo-editor')) {
+    markMemoDirty();
+    if (event.target.matches('.memo-section-body')) autosize(event.target);
+    if (event.target.matches('.memo-section-heading, .memo-section-status')) renderMemoOutline();
+  }
   if (event.target.id === 'draft-body') {
     const preview = document.querySelector('#draft-preview');
     if (preview && state.editing) {
       preview.innerHTML = state.editing.kind === 'deck' ? slidePreview(event.target.value) : markdown(event.target.value);
     }
   }
+});
+
+// A blank section heading fails validation; make sure it is visible so the browser can point to it.
+document.addEventListener('invalid', event => {
+  if (event.target.closest('.memo-editor')) {
+    showMemoView('sections');
+    event.target.closest('.memo-section')?.classList.remove('collapsed');
+  }
+}, true);
+
+window.addEventListener('beforeunload', event => {
+  if (document.querySelector('#edit-delivery-form[data-dirty="true"]')) event.preventDefault();
 });
 
 document.addEventListener('change', async event => {
@@ -3174,7 +3405,7 @@ document.addEventListener('submit', async event => {
       toast('Workstream set up. Open it from Engagement Workstreams to use the toolkit.');
     } else if (form.id === 'edit-delivery-form') {
       await send(`/projects/${state.editingProject}/deliverables/${state.editing.id}`, {
-        ...values,
+        ...deliveryPayload(form),
         updated: state.editing.updated
       }, 'PATCH');
       const updated = await api(`/projects/${state.editingProject}/deliverables/${state.editing.id}`);
@@ -3228,6 +3459,10 @@ document.addEventListener('submit', async event => {
       state.setupTab = 'team';
       await reloadCurrent();
       toast('Teammate granted access to project.');
+    } else if (form.id === 'delete-memo-section-form') {
+      finishModal();
+      removeMemoSection(form.dataset.id);
+      toast('Section removed. Save the draft to keep this change.');
     } else if (form.id === 'delete-workstream-form') {
       await api(`/projects/${form.dataset.project}/deliverables/${form.dataset.id}`, { method: 'DELETE' });
       finishModal();

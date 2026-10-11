@@ -126,7 +126,7 @@ test('authentication, invitations, isolation, collaboration, and review workflow
     const invalid = await member.request(`/projects/${ownerProject}/deliverables`, 'POST', memoInput([memberResource])); assert.equal(invalid.status, 403);
     const valid = await member.request(`/projects/${ownerProject}/deliverables`, 'POST', memoInput([ownerResource])); assert.equal(valid.status, 201); draftId = valid.body.id;
     const draft = (await admin.request(`/projects/${ownerProject}/deliverables/${draftId}`)).body.deliverable;
-    assert.match(draft.body, /IFRS 15/); assert.match(draft.body, /Secret brief.md/); assert.match(draft.body, /WORKING OUTLINE/);
+    assert.match(draft.body, /IFRS 15/); assert.match(draft.body, /Secret brief.md/); assert.match(draft.body, /## Executive summary/);
     assert.equal((await member.request(`/projects/${memberProject}/deliverables/${draftId}`)).status, 404);
     assert.equal((await member.request(`/projects/${memberProject}/deliverables/${draftId}/export/docx`)).status, 404);
   });
@@ -668,7 +668,7 @@ test('workstream setup saves intake separately from toolkit generation', async t
       const draft = (await owner.request(workstreamPath)).body.deliverable;
       assert.equal(draft.status, 'Draft');
       assert.notEqual(draft.updated, setup.updated);
-      assert.match(draft.body, /WORKING OUTLINE|IPO/);
+      assert.match(draft.body, kind === 'memo' ? /## Authoritative guidance[\s\S]*ASC 606/ : /IPO/);
       assert.match(draft.body, /Secret brief.md/);
       const projectAfter = (await owner.request(`/projects/${projectId}`)).body;
       const document = projectAfter.resources.find(r => r.workstream_id === id);
@@ -803,3 +803,63 @@ test('older databases upgrade before workstream indexes are created and preserve
 
 
 
+
+test('memo builder stores ordered sections, composes the Markdown body, and exports a structured memo', async () => {
+  const owner = client();
+  await owner.request('/auth/login', 'POST', { email: 'owner@example.test', password: 'correct horse battery staple' });
+  const projectId = (await owner.request('/projects', 'POST', projectInput('Memo sections'))).body.project.id;
+  const evidenceId = (await owner.request(`/projects/${projectId}/resources`, 'POST', resourceInput())).body.id;
+  const id = (await owner.request(`/projects/${projectId}/workstreams`, 'POST', memoInput([evidenceId]))).body.id;
+  const path = `/projects/${projectId}/deliverables/${id}`;
+  assert.equal((await owner.request(path)).body.deliverable.memo, null, 'Setup has no sections yet');
+  await owner.request(path + '/generate', 'POST', { updated: (await owner.request(path)).body.deliverable.updated });
+
+  const draft = (await owner.request(path)).body.deliverable;
+  const headings = draft.memo.sections.map(s => s.heading);
+  assert.deepEqual(headings.slice(0, 3), ['Executive summary', 'Purpose and scope', 'Background and key facts']);
+  assert.ok(draft.memo.sections.every(s => s.status === 'Not started' && /^[\w-]+$/.test(s.id)));
+  assert.equal(draft.memo.sections.find(s => s.heading === 'Purpose and scope').body, 'Document the question using this project only.');
+  assert.match(draft.memo.sections.find(s => s.heading === 'References and evidence').body, /\[1\] Secret brief\.md/);
+  assert.equal(draft.memo.signoff.preparer, 'Workspace Owner');
+
+  const [first, second, ...rest] = draft.memo.sections;
+  const memo = {
+    header: { to: 'Audit Committee', from: 'Technical team', cc: '', date: '2027-04-15' },
+    signoff: { preparer: 'Workspace Owner', reviewer: 'Engagement Partner', approver: '' },
+    sections: [{ ...second, body: 'Scope <confirmed> & agreed.', status: 'Ready for review' }, { ...first, status: 'Drafting', body: '### Issue 1\n- Point & detail' }, ...rest]
+  };
+  const invalid = structuredClone(memo); invalid.sections[0].status = 'Done';
+  assert.equal((await owner.request(path, 'PATCH', { title: draft.title, status: 'Draft', memo: invalid, updated: draft.updated })).status, 400);
+  const duplicate = structuredClone(memo); duplicate.sections[1].id = duplicate.sections[0].id;
+  assert.equal((await owner.request(path, 'PATCH', { title: draft.title, status: 'Draft', memo: duplicate, updated: draft.updated })).status, 400);
+  assert.equal((await owner.request(path, 'PATCH', { title: draft.title, status: 'Draft', memo: { ...memo, sections: [] }, updated: draft.updated })).status, 400);
+  assert.equal((await owner.request(path, 'PATCH', { title: draft.title, status: 'In review', memo, updated: draft.updated })).status, 200);
+
+  const saved = (await owner.request(path)).body.deliverable;
+  assert.deepEqual(saved.memo.sections.map(s => [s.id, s.status]), memo.sections.map(s => [s.id, s.status]));
+  assert.ok(saved.body.indexOf('## Purpose and scope') < saved.body.indexOf('## Executive summary'), 'Body follows the saved section order');
+  assert.match(saved.body, /To: Audit Committee/);
+  assert.match(saved.body, /- Reviewed by: Engagement Partner/);
+  const draftDoc = (await owner.request(`/projects/${projectId}`)).body.resources.find(r => r.workstream_id === id && r.kind === 'draft');
+  assert.ok(draftDoc.size > 0);
+
+  const docx = unzipStored((await owner.request(path + '/export/docx')).body).get('word/document.xml');
+  assert.match(docx, /TECHNICAL ACCOUNTING MEMORANDUM/);
+  assert.match(docx, /Audit Committee/);
+  assert.match(docx, /1\. Purpose and scope/);
+  assert.match(docx, /Scope &lt;confirmed&gt; &amp; agreed\./);
+  assert.match(docx, /Engagement Partner/);
+  assert.match(docx, /Review and sign-off/);
+  assert.equal((docx.match(/<w:tbl>/g) || []).length, 2, 'Cover block and sign-off are tables');
+
+  // A plain Markdown save stays canonical and the sections are recovered from it.
+  const markdownBody = saved.body.replace('Scope <confirmed> & agreed.', 'Scope revised in Markdown.');
+  assert.equal((await owner.request(path, 'PATCH', { title: saved.title, status: 'In review', body: markdownBody, updated: saved.updated })).status, 200);
+  const recovered = (await owner.request(path)).body.deliverable;
+  assert.equal(recovered.body, markdownBody);
+  assert.equal(recovered.memo.sections[0].body, 'Scope revised in Markdown.');
+  assert.equal(recovered.memo.header.to, 'Audit Committee');
+  assert.equal(recovered.memo.signoff.reviewer, 'Engagement Partner');
+  assert.ok(!recovered.memo.sections.some(s => s.heading === 'Review and sign-off'));
+  assert.equal(recovered.memo.sections.find(s => s.heading === 'Analysis').status, 'Not started');
+});

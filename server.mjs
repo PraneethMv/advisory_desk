@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import { DatabaseSync } from 'node:sqlite';
 import { buildDraft, STANDARD_CATALOG } from './lib/drafts.mjs';
 import { exportDocument } from './lib/exports.mjs';
+import { MEMO_GUIDE, DEFAULT_MEMO_HEADINGS, SECTION_STATUSES, composeMemo, memoFromBody } from './lib/memo.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const deriveKey = promisify(scrypt);
@@ -26,7 +27,9 @@ const safeUser = u => ({
   usagePolicyAccepted: Boolean(u.demo || u.usage_policy_accepted_at)
 });
 const PROJECT_TYPES = ['Technical memo', 'GAAP transition', 'IPO advisory', 'Accounting advisory', 'Staff augmentation', 'Training'];
-const DEFAULT_SETTINGS = { workspaceName: 'Advisory team', memoTemplateName: 'Technical accounting memorandum', memoHeadings: 'Purpose and scope\nBackground and facts\nAccounting questions\nApplicable guidance\nAnalysis\nConclusion\nProject evidence\nReview checklist' };
+const LEGACY_MEMO_HEADINGS = 'Purpose and scope\nBackground and facts\nAccounting questions\nApplicable guidance\nAnalysis\nConclusion\nProject evidence\nReview checklist';
+const DEFAULT_SETTINGS = { workspaceName: 'Advisory team', memoTemplateName: 'Technical accounting memorandum', memoHeadings: DEFAULT_MEMO_HEADINGS.join('\n') };
+const MEMO_GUIDE_PUBLIC = MEMO_GUIDE.map(({ heading, aliases, hint, optional }) => ({ heading, aliases, hint, optional: Boolean(optional) }));
 class ApiError extends Error { constructor(status, message) { super(message); this.status = status; } }
 function requireValue(condition, message, status = 400) { if (!condition) throw new ApiError(status, message); }
 function textField(value, label, max = 200, required = true) {
@@ -35,6 +38,25 @@ function textField(value, label, max = 200, required = true) {
   requireValue(!required || text.length > 0, `${label} is required.`);
   requireValue(text.length <= max, `${label} is too long.`);
   return text;
+}
+function memoField(raw) {
+  requireValue(raw && typeof raw === 'object' && !Array.isArray(raw), 'Provide the memo sections.');
+  const record = (value, keys, label) => {
+    requireValue(value == null || (typeof value === 'object' && !Array.isArray(value)), `${label} is invalid.`);
+    return Object.fromEntries(keys.map(([key, name]) => [key, textField(value?.[key], name, 200, false)]));
+  };
+  const header = record(raw.header, [['to', 'To'], ['from', 'From'], ['cc', 'CC'], ['date', 'Date']], 'Memo header');
+  const signoff = record(raw.signoff, [['preparer', 'Prepared by'], ['reviewer', 'Reviewed by'], ['approver', 'Approved by']], 'Sign-off');
+  requireValue(Array.isArray(raw.sections) && raw.sections.length >= 1 && raw.sections.length <= 40, 'A memo needs 1–40 sections.');
+  const ids = new Set();
+  const sections = raw.sections.map(section => {
+    requireValue(section && typeof section === 'object', 'A memo section is invalid.');
+    requireValue(typeof section.id === 'string' && /^[\w-]{1,64}$/.test(section.id) && !ids.has(section.id), 'A memo section is invalid.');
+    ids.add(section.id);
+    requireValue(SECTION_STATUSES.includes(section.status), 'Choose a valid section status.');
+    return { id: section.id, heading: textField(section.heading, 'Section heading', 160), body: textField(section.body, 'Section content', 30000, false), status: section.status };
+  });
+  return { header, signoff, sections };
 }
 function emailField(value) {
   const email = textField(value, 'Email', 254).toLowerCase();
@@ -136,6 +158,10 @@ export async function createApp(options = {}) {
   if (!deliverableColumns.has('is_final')) {
     db.exec('ALTER TABLE deliverables ADD COLUMN is_final INTEGER NOT NULL DEFAULT 0');
   }
+  // Structured memo sections (JSON). Empty means the Markdown body is canonical.
+  if (!deliverableColumns.has('memo')) {
+    db.exec("ALTER TABLE deliverables ADD COLUMN memo TEXT NOT NULL DEFAULT ''");
+  }
 
   const resourceColumns = new Set(db.prepare('PRAGMA table_info(resources)').all().map(column => column.name));
   if (!resourceColumns.has('workstream_id')) {
@@ -145,6 +171,15 @@ export async function createApp(options = {}) {
 
   db.prepare('INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)').run('workspace', JSON.stringify(DEFAULT_SETTINGS));
   const getSettings = () => JSON.parse(db.prepare('SELECT value FROM settings WHERE key=?').get('workspace').value);
+  const storedSettings = getSettings();
+  if (storedSettings.memoHeadings === LEGACY_MEMO_HEADINGS) {
+    db.prepare('UPDATE settings SET value=? WHERE key=?').run(JSON.stringify({ ...storedSettings, memoHeadings: DEFAULT_SETTINGS.memoHeadings }), 'workspace');
+  }
+  const memoOf = delivery => delivery.kind !== 'memo' ? null : delivery.memo ? JSON.parse(delivery.memo) : delivery.body.trim() ? memoFromBody(delivery.body) : null;
+  const exportContext = (delivery, project) => {
+    const memo = memoOf(delivery);
+    return memo ? { memo, project, gaap: JSON.parse(delivery.params).gaap } : {};
+  };
   const transaction = fn => {
     db.exec('BEGIN IMMEDIATE');
     try { const result = fn(); db.exec('COMMIT'); return result; } catch (error) { db.exec('ROLLBACK'); throw error; }
@@ -174,7 +209,7 @@ export async function createApp(options = {}) {
     const token = randomBytes(32).toString('hex'); const csrf = randomBytes(24).toString('hex');
     db.prepare('DELETE FROM sessions WHERE expires < ?').run(Date.now());
     db.prepare('INSERT INTO sessions VALUES (?,?,?,?)').run(hash(token), user.id, csrf, Date.now() + 8 * 60 * 60 * 1000);
-    respond(res, 200, { user: safeUser(user), csrf, workspace: getSettings(), standards: STANDARD_CATALOG }, {
+    respond(res, 200, { user: safeUser(user), csrf, workspace: getSettings(), standards: STANDARD_CATALOG, memoGuide: MEMO_GUIDE_PUBLIC, sectionStatuses: SECTION_STATUSES }, {
       'Set-Cookie': `advisory_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${secureCookie ? '; Secure' : ''}`
     });
   }
@@ -237,11 +272,11 @@ export async function createApp(options = {}) {
       if (i < 4) {
         const kind = i === 1 || i === 2 ? 'deck' : 'memo';
         const params = kind === 'memo' ? { gaap: f[3], standards: [STANDARD_CATALOG[f[3]][i === 0 ? 3 : 7]], problem: f[4] } : { deckType: 'Proposal', area: i === 1 ? 'GAAP transition' : 'IPO', problem: f[4], ipoTrack: i === 2 ? 'Readiness' : '', currentGaap: i === 1 ? 'Other' : '', targetGaap: 'Ind AS' };
-        const draft = buildDraft({ kind, title: f[0], params, project, resources: [] });
+        const draft = buildDraft({ kind, title: f[0], params, project, resources: [], author: user.name });
         const isFinalVal = i === 2 ? 1 : 0;
         const workstreamId = randomUUID();
         const createdNow = now();
-        db.prepare('INSERT INTO deliverables (id, project_id, kind, title, params, body, status, created_by, created, updated, is_final) VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(workstreamId, project.id, kind, f[0], JSON.stringify(params), draft.body, isFinalVal ? 'Final' : (i === 0 ? 'In review' : 'Draft'), user.id, createdNow, createdNow, isFinalVal);
+        db.prepare('INSERT INTO deliverables (id, project_id, kind, title, params, body, status, created_by, created, updated, is_final, memo) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(workstreamId, project.id, kind, f[0], JSON.stringify(params), draft.body, isFinalVal ? 'Final' : (i === 0 ? 'In review' : 'Draft'), user.id, createdNow, createdNow, isFinalVal, draft.memo ? JSON.stringify(draft.memo) : '');
         const draftBuf = Buffer.from(draft.body, 'utf8');
         db.prepare('INSERT INTO resources (id, project_id, name, kind, size, content, text, created_by, created, workstream_id) VALUES (?,?,?,?,?,?,?,?,?,?)').run(randomUUID(), project.id, `${f[0]}.md`, 'draft', draftBuf.length, draftBuf, draft.body, user.id, createdNow, workstreamId);
         activity(project.id, user.id, `Created a ${kind === 'memo' ? 'technical memo' : 'slide deck'} outline`);
@@ -309,7 +344,7 @@ export async function createApp(options = {}) {
       }
       const user = session(req);
       if (!['GET', 'HEAD'].includes(method)) requireValue(req.headers['x-csrf-token'] === user.csrf, 'Your security token is invalid. Refresh and try again.', 403);
-      if (path === '/api/me' && method === 'GET') { respond(res, 200, { user: safeUser(user), csrf: user.csrf, workspace: getSettings(), standards: STANDARD_CATALOG }); return; }
+      if (path === '/api/me' && method === 'GET') { respond(res, 200, { user: safeUser(user), csrf: user.csrf, workspace: getSettings(), standards: STANDARD_CATALOG, memoGuide: MEMO_GUIDE_PUBLIC, sectionStatuses: SECTION_STATUSES }); return; }
       if (path === '/api/me/preferences' && method === 'PATCH') {
         requireValue(!user.demo, 'Sample users do not need onboarding preferences.', 403);
         const input = await payload(req);
@@ -548,15 +583,16 @@ export async function createApp(options = {}) {
           const resourceIds = [...new Set(input.resourceIds)];
           const resources = resourceIds.map(id => { const r = db.prepare('SELECT id,name,kind,text FROM resources WHERE id=? AND project_id=?').get(id, project.id); requireValue(r, 'A selected resource is outside this project or unavailable.', 403); return r; });
           params.resourceIds = resourceIds;
-          const body = setupOnly ? '' : buildDraft({ kind: input.kind, title, params, project, resources, settings: getSettings() }).body;
+          const draft = setupOnly ? null : buildDraft({ kind: input.kind, title, params, project, resources, settings: getSettings(), author: user.name });
+          const body = draft?.body || '';
           const id = randomUUID();
           const docId = setupOnly ? null : randomUUID();
           const docName = `${title}.md`;
           const draftContent = Buffer.from(body, 'utf8');
           const createdTime = now();
           transaction(() => {
-            db.prepare('INSERT INTO deliverables (id, project_id, kind, title, params, body, status, created_by, created, updated, is_final) VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(
-              id, project.id, input.kind, title, JSON.stringify(params), body, setupOnly ? 'Setup' : 'Draft', user.id, createdTime, createdTime, 0
+            db.prepare('INSERT INTO deliverables (id, project_id, kind, title, params, body, status, created_by, created, updated, is_final, memo) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(
+              id, project.id, input.kind, title, JSON.stringify(params), body, setupOnly ? 'Setup' : 'Draft', user.id, createdTime, createdTime, 0, draft?.memo ? JSON.stringify(draft.memo) : ''
             );
             if (!setupOnly) {
               db.prepare('INSERT INTO resources (id, project_id, name, kind, size, content, text, created_by, created, workstream_id) VALUES (?,?,?,?,?,?,?,?,?,?)').run(
@@ -582,12 +618,12 @@ export async function createApp(options = {}) {
             requireValue(resource, 'A selected resource is outside this project or unavailable. Restore it before creating the outline.', 409);
             return resource;
           });
-          const draft = buildDraft({ kind: delivery.kind, title: delivery.title, params, project, resources, settings: getSettings() });
+          const draft = buildDraft({ kind: delivery.kind, title: delivery.title, params, project, resources, settings: getSettings(), author: user.name });
           const bytes = Buffer.from(draft.body, 'utf8');
           const updated = new Date(Math.max(Date.now(), Date.parse(delivery.updated) + 1)).toISOString();
           const resourceId = randomUUID();
           transaction(() => {
-            db.prepare("UPDATE deliverables SET body=?,status='Draft',updated=? WHERE id=? AND project_id=?").run(draft.body, updated, delivery.id, project.id);
+            db.prepare("UPDATE deliverables SET body=?,memo=?,status='Draft',updated=? WHERE id=? AND project_id=?").run(draft.body, draft.memo ? JSON.stringify(draft.memo) : '', updated, delivery.id, project.id);
             db.prepare('INSERT INTO resources (id, project_id, name, kind, size, content, text, created_by, created, workstream_id) VALUES (?,?,?,?,?,?,?,?,?,?)').run(
               resourceId, project.id, `${delivery.title}.md`, 'draft', bytes.length, bytes, draft.body, delivery.created_by, delivery.created, delivery.id
             );
@@ -618,7 +654,7 @@ export async function createApp(options = {}) {
           requireValue(delivery.body.trim(), 'Open the workstream toolkit and create an outline before exporting.', 409);
           const input = await payload(req).catch(() => ({}));
           const format = input.format === 'docx' || input.format === 'pptx' ? input.format : (delivery.kind === 'memo' ? 'docx' : 'pptx');
-          const exported = exportDocument(delivery, format);
+          const exported = exportDocument(delivery, format, exportContext(delivery, project));
           const docId = randomUUID();
           const docName = `${delivery.title.replace(/[^\p{L}\p{N} _-]/gu, '').slice(0, 100) || 'deliverable'}.${format}`;
           transaction(() => {
@@ -637,11 +673,11 @@ export async function createApp(options = {}) {
           if (deliveryMatch[2] && method === 'GET') {
             requireValue(delivery.body.trim(), 'Open the workstream toolkit and create an outline before exporting.', 409);
             const format = deliveryMatch[2]; requireValue(format === 'md' || (delivery.kind === 'memo' ? format === 'docx' : format === 'pptx'), 'This format is unavailable for this deliverable.');
-            const exported = exportDocument(delivery, format);
+            const exported = exportDocument(delivery, format, exportContext(delivery, project));
             const filename = `${delivery.title.replace(/[^\p{L}\p{N} _-]/gu, '').slice(0, 100) || 'deliverable'}.${format}`;
             res.writeHead(200, { ...headers, 'Content-Type': exported.mime, 'Content-Disposition': `attachment; filename="deliverable.${format}"; filename*=UTF-8''${encodeURIComponent(filename).replace(/'/g, '%27')}` }); res.end(exported.bytes); return;
           }
-          if (method === 'GET' && !deliveryMatch[2]) { respond(res, 200, { deliverable: { ...delivery, params: JSON.parse(delivery.params) } }); return; }
+          if (method === 'GET' && !deliveryMatch[2]) { respond(res, 200, { deliverable: { ...delivery, params: JSON.parse(delivery.params), memo: memoOf(delivery) } }); return; }
           if (method === 'DELETE' && !deliveryMatch[2]) {
             requireValue(delivery.created_by === user.id || project.owner_id === user.id, 'Only the workstream creator or project owner may delete a workstream.', 403);
             transaction(() => {
@@ -655,14 +691,18 @@ export async function createApp(options = {}) {
             return;
           }
           if (method === 'PATCH' && !deliveryMatch[2]) {
-            const input = await payload(req); const title = textField(input.title, 'Title', 160); const body = textField(input.body, 'Content', 200000);
+            const input = await payload(req); const title = textField(input.title, 'Title', 160);
+            // Memos save as sections and compose their Markdown body; a plain Markdown save clears the sections so they are re-derived from it.
+            const memo = delivery.kind === 'memo' && input.memo !== undefined ? memoField(input.memo) : null;
+            const body = memo ? composeMemo({ title, memo, project, gaap: JSON.parse(delivery.params).gaap }) : textField(input.body, 'Content', 200000);
+            requireValue(body.length <= 200000, 'Content is too long.');
             requireValue(['Draft', 'In review', 'Approved', 'Final'].includes(input.status), 'Choose a valid review status.');
             requireValue(input.updated === delivery.updated, 'This draft was updated by someone else. Reopen it before saving.', 409);
             const isFinalVal = input.is_final !== undefined ? (input.is_final ? 1 : 0) : (input.status === 'Final' ? 1 : delivery.is_final);
             const updated = new Date(Math.max(Date.now(), Date.parse(delivery.updated) + 1)).toISOString();
             transaction(() => {
-              db.prepare('UPDATE deliverables SET title=?,body=?,status=?,updated=?,is_final=? WHERE id=? AND project_id=?').run(
-                title, body, input.status, updated, isFinalVal, delivery.id, project.id
+              db.prepare('UPDATE deliverables SET title=?,body=?,memo=?,status=?,updated=?,is_final=? WHERE id=? AND project_id=?').run(
+                title, body, memo ? JSON.stringify(memo) : '', input.status, updated, isFinalVal, delivery.id, project.id
               );
               // Sync corresponding draft document in resources
               const draftDoc = db.prepare("SELECT id FROM resources WHERE workstream_id=? AND project_id=? AND kind='draft'").get(delivery.id, project.id);
