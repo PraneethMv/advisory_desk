@@ -244,6 +244,13 @@ function userMenuDropdown() {
   `;
 }
 
+// Workspace settings sit at the far right of every top bar. Only the super user can open them.
+function settingsButton() {
+  if (state.user?.role !== 'super_user' || state.user.demo) return '';
+  const active = state.page === 'settings';
+  return `<a href="#settings" class="icon-btn topbar-settings ${active ? 'active' : ''}" title="Settings" aria-label="Settings" ${active ? 'aria-current="page"' : ''}>${icon('settings')}</a>`;
+}
+
 function getEngagementManagerName() {
   if (state.projects && state.projects.length > 0) {
     const p = state.projects.find(proj => proj.owner_name && proj.owner_name !== state.user?.name);
@@ -754,11 +761,8 @@ function renderHub() {
             <span class="topbar-divider"></span>
             ${notificationMenuDropdown()}
             <span class="topbar-divider"></span>
-            <a href="#desk" class="btn secondary small-btn">
-              <span class="avatar tiny">${e(initials(state.user.name))}</span>
-              <span>${e(state.user.name)}</span>
-            </a>
-            ${button(icon('logout'), 'logout', 'icon-btn', 'aria-label="Sign out" title="Sign out"')}
+            ${userMenuDropdown()}
+            ${settingsButton()}
           ` : ''}
         </div>
       </header>
@@ -940,7 +944,6 @@ function shell(content, title = 'Projects', trail = '') {
   const sidebarBottom = `
     <div class="sidebar-bottom">
       ${isProject ? kbExternalLink : ''}
-      ${state.user.role === 'super_user' && !state.user.demo && !isProject ? nav('settings', 'Settings', 'settings') : ''}
     </div>
   `;
 
@@ -980,6 +983,7 @@ function shell(content, title = 'Projects', trail = '') {
             ${notificationMenuDropdown()}
             <span class="topbar-divider"></span>
             ${userMenuDropdown()}
+            ${settingsButton()}
           </div>
         </header>
 
@@ -1031,6 +1035,7 @@ function renderDesk() {
           ${notificationMenuDropdown()}
           <span class="topbar-divider"></span>
           ${userMenuDropdown()}
+          ${settingsButton()}
         </div>
       </header>
 

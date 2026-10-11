@@ -1266,6 +1266,45 @@ button.toolkit-item:hover:not(.muted) {
   background: var(--bg-surface-variant);
 }
 
+/* Settings button at the far right of every top bar */
+.topbar-settings {
+  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
+  border: 1px solid var(--outline);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+}
+.topbar-settings:hover {
+  color: var(--text-primary);
+}
+.topbar-settings.active {
+  border-color: var(--brand-blue);
+  background: var(--brand-blue-container);
+  color: var(--brand-blue);
+}
+
+/* On phones every top bar keeps only what fits: the current page name, notifications,
+   the account avatar, and Settings. */
+@media (max-width: 640px) {
+  .user-menu-name,
+  .user-menu-caret,
+  .net-indicator,
+  .topbar .breadcrumb > a,
+  .topbar .breadcrumb > .icon,
+  .topbar-right > .btn,
+  .topbar-right > .topbar-divider,
+  .workbench-crumb-group,
+  .workbench-topbar .topbar-divider {
+    display: none;
+  }
+  .topbar-right,
+  .workbench-topbar-right,
+  .splash-top-right {
+    gap: 8px;
+  }
+}
+
 .user-menu-name {
   max-width: 140px;
   overflow: hidden;
