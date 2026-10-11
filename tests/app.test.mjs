@@ -6,6 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createApp } from '../server.mjs';
 import { buildDraft } from '../lib/drafts.mjs';
 import { exportDocument } from '../lib/exports.mjs';
+import { memoFromBody } from '../lib/memo.mjs';
 
 let app, origin, dataDir;
 before(async () => {
@@ -126,7 +127,7 @@ test('authentication, invitations, isolation, collaboration, and review workflow
     const invalid = await member.request(`/projects/${ownerProject}/deliverables`, 'POST', memoInput([memberResource])); assert.equal(invalid.status, 403);
     const valid = await member.request(`/projects/${ownerProject}/deliverables`, 'POST', memoInput([ownerResource])); assert.equal(valid.status, 201); draftId = valid.body.id;
     const draft = (await admin.request(`/projects/${ownerProject}/deliverables/${draftId}`)).body.deliverable;
-    assert.match(draft.body, /IFRS 15/); assert.match(draft.body, /Secret brief.md/); assert.match(draft.body, /## Executive summary/);
+    assert.match(draft.body, /IFRS 15/); assert.deepEqual(draft.params.resourceIds, [ownerResource]); assert.match(draft.body, /## Executive summary/);
     assert.equal((await member.request(`/projects/${memberProject}/deliverables/${draftId}`)).status, 404);
     assert.equal((await member.request(`/projects/${memberProject}/deliverables/${draftId}/export/docx`)).status, 404);
   });
@@ -669,7 +670,9 @@ test('workstream setup saves intake separately from toolkit generation', async t
       assert.equal(draft.status, 'Draft');
       assert.notEqual(draft.updated, setup.updated);
       assert.match(draft.body, kind === 'memo' ? /## Authoritative guidance[\s\S]*ASC 606/ : /IPO/);
-      assert.match(draft.body, /Secret brief.md/);
+      // Memos keep their engagement documents in Memo Base; decks still list them in the outline.
+      if (kind === 'memo') assert.deepEqual(draft.params.resourceIds, [evidenceId]);
+      else assert.match(draft.body, /Secret brief.md/);
       const projectAfter = (await owner.request(`/projects/${projectId}`)).body;
       const document = projectAfter.resources.find(r => r.workstream_id === id);
       assert.equal(projectAfter.deliverables.length, 1, 'Generation must reuse the configured workstream');
@@ -819,24 +822,54 @@ test('memo builder stores ordered sections, composes the Markdown body, and expo
   assert.deepEqual(headings.slice(0, 3), ['Executive summary', 'Purpose and scope', 'Background and key facts']);
   assert.ok(draft.memo.sections.every(s => s.status === 'Not started' && /^[\w-]+$/.test(s.id)));
   assert.equal(draft.memo.sections.find(s => s.heading === 'Purpose and scope').body, 'Document the question using this project only.');
-  assert.match(draft.memo.sections.find(s => s.heading === 'References and evidence').body, /\[1\] Secret brief\.md/);
+  assert.ok(!headings.some(h => /evidence|checklist/i.test(h)), 'Evidence and the checklist live outside the Builder');
   assert.equal(draft.memo.signoff.preparer, 'Workspace Owner');
+  assert.deepEqual(draft.memo.completion, { facts: false, guidance: false, judgments: false, approval: false });
 
   const [first, second, ...rest] = draft.memo.sections;
   const memo = {
     header: { to: 'Audit Committee', from: 'Technical team', cc: '', date: '2027-04-15' },
+    preface: 'Prepared for the audit committee meeting.',
     signoff: { preparer: 'Workspace Owner', reviewer: 'Engagement Partner', approver: '' },
-    sections: [{ ...second, body: 'Scope <confirmed> & agreed.', status: 'Ready for review' }, { ...first, status: 'Drafting', body: '### Issue 1\n- Point & detail' }, ...rest]
+    sections: [{ ...second, body: 'Scope <confirmed> & agreed.', status: 'Ready for review' }, { ...first, status: 'Drafting', body: '### Issue 1\n- Point & detail' }, ...rest],
+    completion: { facts: false, guidance: false, judgments: false, approval: false }
   };
+  // The completion checklist stays closed until every section is ready for review.
+  const early = { ...memo, completion: { ...memo.completion, facts: true } };
+  assert.equal((await owner.request(path, 'PATCH', { title: draft.title, status: 'Draft', memo: early, updated: draft.updated })).status, 409);
+  // Memo Base: standards and engagement documents are validated and kept on the workstream.
+  const otherProject = (await owner.request('/projects', 'POST', projectInput('Memo base other'))).body.project.id;
+  const outsideId = (await owner.request(`/projects/${otherProject}/resources`, 'POST', resourceInput())).body.id;
+  const base = { gaap: 'IFRS', standards: ['IFRS 15 · Revenue from Contracts with Customers', 'IFRIC 23'], resourceIds: [evidenceId] };
+  assert.equal((await owner.request(path, 'PATCH', { title: draft.title, status: 'Draft', memo, base: { ...base, resourceIds: [outsideId] }, updated: draft.updated })).status, 403);
+  assert.equal((await owner.request(path, 'PATCH', { title: draft.title, status: 'Draft', memo, base: { ...base, gaap: 'K-GAAP' }, updated: draft.updated })).status, 400);
   const invalid = structuredClone(memo); invalid.sections[0].status = 'Done';
   assert.equal((await owner.request(path, 'PATCH', { title: draft.title, status: 'Draft', memo: invalid, updated: draft.updated })).status, 400);
   const duplicate = structuredClone(memo); duplicate.sections[1].id = duplicate.sections[0].id;
   assert.equal((await owner.request(path, 'PATCH', { title: draft.title, status: 'Draft', memo: duplicate, updated: draft.updated })).status, 400);
   assert.equal((await owner.request(path, 'PATCH', { title: draft.title, status: 'Draft', memo: { ...memo, sections: [] }, updated: draft.updated })).status, 400);
-  assert.equal((await owner.request(path, 'PATCH', { title: draft.title, status: 'In review', memo, updated: draft.updated })).status, 200);
+  assert.equal((await owner.request(path, 'PATCH', { title: draft.title, status: 'In review', memo, base, updated: draft.updated })).status, 200);
 
   const saved = (await owner.request(path)).body.deliverable;
   assert.deepEqual(saved.memo.sections.map(s => [s.id, s.status]), memo.sections.map(s => [s.id, s.status]));
+  assert.deepEqual(saved.params.standards, base.standards);
+  assert.deepEqual(saved.params.resourceIds, [evidenceId]);
+  assert.equal(saved.memo.preface, memo.preface);
+  assert.match(saved.body, /Framework: IFRS\n\nPrepared for the audit committee meeting\.\n\n## Purpose and scope/);
+
+  const allReady = { ...memo, sections: memo.sections.map(s => ({ ...s, status: 'Ready for review' })), completion: { ...memo.completion, facts: true } };
+  assert.equal((await owner.request(path, 'PATCH', { title: saved.title, status: 'In review', memo: allReady, updated: saved.updated })).status, 200);
+  const completed = (await owner.request(path)).body.deliverable;
+  assert.equal(completed.memo.completion.facts, true);
+  // Reopening a section keeps what was already ticked.
+  const reopened = { ...completed.memo, sections: completed.memo.sections.map((s, i) => i ? s : { ...s, status: 'Drafting' }) };
+  assert.equal((await owner.request(path, 'PATCH', { title: saved.title, status: 'In review', memo: reopened, updated: completed.updated })).status, 200);
+  const afterReopen = (await owner.request(path)).body.deliverable;
+  assert.equal(afterReopen.memo.completion.facts, true);
+  assert.equal((await owner.request(path, 'PATCH', { title: saved.title, status: 'In review', memo: { ...reopened, completion: { ...reopened.completion, guidance: true } }, updated: afterReopen.updated })).status, 409);
+  const restored = { ...memo, sections: memo.sections.map(s => ({ ...s })) };
+  assert.equal((await owner.request(path, 'PATCH', { title: saved.title, status: 'In review', memo: restored, updated: afterReopen.updated })).status, 200);
+  const latest = (await owner.request(path)).body.deliverable;
   assert.ok(saved.body.indexOf('## Purpose and scope') < saved.body.indexOf('## Executive summary'), 'Body follows the saved section order');
   assert.match(saved.body, /To: Audit Committee/);
   assert.match(saved.body, /- Reviewed by: Engagement Partner/);
@@ -853,13 +886,30 @@ test('memo builder stores ordered sections, composes the Markdown body, and expo
   assert.equal((docx.match(/<w:tbl>/g) || []).length, 2, 'Cover block and sign-off are tables');
 
   // A plain Markdown save stays canonical and the sections are recovered from it.
-  const markdownBody = saved.body.replace('Scope <confirmed> & agreed.', 'Scope revised in Markdown.');
-  assert.equal((await owner.request(path, 'PATCH', { title: saved.title, status: 'In review', body: markdownBody, updated: saved.updated })).status, 200);
+  const markdownBody = latest.body.replace('Scope <confirmed> & agreed.', 'Scope revised in Markdown.');
+  assert.equal((await owner.request(path, 'PATCH', { title: latest.title, status: 'In review', body: markdownBody, updated: latest.updated })).status, 200);
   const recovered = (await owner.request(path)).body.deliverable;
   assert.equal(recovered.body, markdownBody);
   assert.equal(recovered.memo.sections[0].body, 'Scope revised in Markdown.');
   assert.equal(recovered.memo.header.to, 'Audit Committee');
+  assert.equal(recovered.memo.preface, 'Prepared for the audit committee meeting.');
   assert.equal(recovered.memo.signoff.reviewer, 'Engagement Partner');
   assert.ok(!recovered.memo.sections.some(s => s.heading === 'Review and sign-off'));
   assert.equal(recovered.memo.sections.find(s => s.heading === 'Analysis').status, 'Not started');
+});
+
+test('legacy memos drop generated evidence and checklist sections but keep written content', () => {
+  const body = [
+    '# Legacy', '', 'To: CFO', '',
+    '## Purpose and scope', '', 'Why.', '',
+    '## Project evidence', '', '- [1] Contract.pdf', '',
+    '## Review checklist', '', '- Facts are complete.', '',
+    '## References and evidence', '', 'See the board minutes discussed on 3 March.', '',
+    '## Review and sign-off', '', '- Prepared by: Analyst'
+  ].join('\n');
+  const memo = memoFromBody(body);
+  assert.deepEqual(memo.sections.map(s => s.heading), ['Purpose and scope', 'References and evidence']);
+  assert.equal(memo.header.to, 'CFO');
+  assert.equal(memo.signoff.preparer, 'Analyst');
+  assert.deepEqual(Object.values(memo.completion), [false, false, false, false]);
 });

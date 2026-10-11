@@ -7,7 +7,7 @@ import { promisify } from 'node:util';
 import { DatabaseSync } from 'node:sqlite';
 import { buildDraft, STANDARD_CATALOG } from './lib/drafts.mjs';
 import { exportDocument } from './lib/exports.mjs';
-import { MEMO_GUIDE, DEFAULT_MEMO_HEADINGS, SECTION_STATUSES, composeMemo, memoFromBody } from './lib/memo.mjs';
+import { MEMO_GUIDE, DEFAULT_MEMO_HEADINGS, SECTION_STATUSES, COMPLETION_CHECKLIST, allSectionsReady, composeMemo, memoFromBody, normaliseMemo } from './lib/memo.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const deriveKey = promisify(scrypt);
@@ -27,9 +27,13 @@ const safeUser = u => ({
   usagePolicyAccepted: Boolean(u.demo || u.usage_policy_accepted_at)
 });
 const PROJECT_TYPES = ['Technical memo', 'GAAP transition', 'IPO advisory', 'Accounting advisory', 'Staff augmentation', 'Training'];
-const LEGACY_MEMO_HEADINGS = 'Purpose and scope\nBackground and facts\nAccounting questions\nApplicable guidance\nAnalysis\nConclusion\nProject evidence\nReview checklist';
+// Earlier workspace defaults; a workspace still on one is moved to the current default.
+const LEGACY_MEMO_HEADINGS = [
+  'Purpose and scope\nBackground and facts\nAccounting questions\nApplicable guidance\nAnalysis\nConclusion\nProject evidence\nReview checklist',
+  [...DEFAULT_MEMO_HEADINGS, 'References and evidence'].join('\n')
+];
 const DEFAULT_SETTINGS = { workspaceName: 'Advisory team', memoTemplateName: 'Technical accounting memorandum', memoHeadings: DEFAULT_MEMO_HEADINGS.join('\n') };
-const MEMO_GUIDE_PUBLIC = MEMO_GUIDE.map(({ heading, aliases, hint, optional }) => ({ heading, aliases, hint, optional: Boolean(optional) }));
+const MEMO_GUIDE_PUBLIC = MEMO_GUIDE.map(({ heading, aliases, hint }) => ({ heading, aliases, hint }));
 class ApiError extends Error { constructor(status, message) { super(message); this.status = status; } }
 function requireValue(condition, message, status = 400) { if (!condition) throw new ApiError(status, message); }
 function textField(value, label, max = 200, required = true) {
@@ -39,7 +43,7 @@ function textField(value, label, max = 200, required = true) {
   requireValue(text.length <= max, `${label} is too long.`);
   return text;
 }
-function memoField(raw) {
+function memoField(raw, previous) {
   requireValue(raw && typeof raw === 'object' && !Array.isArray(raw), 'Provide the memo sections.');
   const record = (value, keys, label) => {
     requireValue(value == null || (typeof value === 'object' && !Array.isArray(value)), `${label} is invalid.`);
@@ -56,7 +60,28 @@ function memoField(raw) {
     requireValue(SECTION_STATUSES.includes(section.status), 'Choose a valid section status.');
     return { id: section.id, heading: textField(section.heading, 'Section heading', 160), body: textField(section.body, 'Section content', 30000, false), status: section.status };
   });
-  return { header, signoff, sections };
+  const preface = textField(raw.preface, 'Preface', 8000, false);
+  requireValue(raw.completion == null || (typeof raw.completion === 'object' && !Array.isArray(raw.completion)), 'Completion checklist is invalid.');
+  const completion = Object.fromEntries(COMPLETION_CHECKLIST.map(({ id }) => {
+    const done = raw.completion?.[id] ?? false;
+    requireValue(typeof done === 'boolean', 'Completion checklist is invalid.');
+    return [id, done];
+  }));
+  // The checklist opens once every Builder section is ready; items ticked earlier stay recorded if a section is reopened.
+  const newlyDone = COMPLETION_CHECKLIST.some(({ id }) => completion[id] && !previous?.completion?.[id]);
+  requireValue(!newlyDone || allSectionsReady(sections), 'Set every Builder section to Ready for review before completing the checklist.', 409);
+  return { header, preface, signoff, sections, completion };
+}
+// Memo Base: framework, applicable standards, and engagement documents for a memo workstream.
+function memoBaseField(raw, params, resourceExists) {
+  requireValue(raw && typeof raw === 'object' && !Array.isArray(raw), 'Memo Base is invalid.');
+  const gaap = textField(raw.gaap, 'Framework'); requireValue(Object.keys(STANDARD_CATALOG).includes(gaap), 'Choose a valid framework.');
+  requireValue(Array.isArray(raw.standards) && raw.standards.length <= 40, 'Select up to 40 standards.');
+  const standards = [...new Set(raw.standards.map(s => textField(s, 'Standard', 500)))];
+  requireValue(Array.isArray(raw.resourceIds) && raw.resourceIds.length <= 50 && raw.resourceIds.every(x => typeof x === 'string'), 'Choose valid engagement documents.');
+  const resourceIds = [...new Set(raw.resourceIds)];
+  requireValue(resourceIds.every(resourceExists), 'A selected document is outside this project or unavailable.', 403);
+  return { ...params, gaap, standards, resourceIds };
 }
 function emailField(value) {
   const email = textField(value, 'Email', 254).toLowerCase();
@@ -172,10 +197,10 @@ export async function createApp(options = {}) {
   db.prepare('INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)').run('workspace', JSON.stringify(DEFAULT_SETTINGS));
   const getSettings = () => JSON.parse(db.prepare('SELECT value FROM settings WHERE key=?').get('workspace').value);
   const storedSettings = getSettings();
-  if (storedSettings.memoHeadings === LEGACY_MEMO_HEADINGS) {
+  if (LEGACY_MEMO_HEADINGS.includes(storedSettings.memoHeadings)) {
     db.prepare('UPDATE settings SET value=? WHERE key=?').run(JSON.stringify({ ...storedSettings, memoHeadings: DEFAULT_SETTINGS.memoHeadings }), 'workspace');
   }
-  const memoOf = delivery => delivery.kind !== 'memo' ? null : delivery.memo ? JSON.parse(delivery.memo) : delivery.body.trim() ? memoFromBody(delivery.body) : null;
+  const memoOf = delivery => delivery.kind !== 'memo' ? null : delivery.memo ? normaliseMemo(JSON.parse(delivery.memo)) : delivery.body.trim() ? memoFromBody(delivery.body) : null;
   const exportContext = (delivery, project) => {
     const memo = memoOf(delivery);
     return memo ? { memo, project, gaap: JSON.parse(delivery.params).gaap } : {};
@@ -209,7 +234,7 @@ export async function createApp(options = {}) {
     const token = randomBytes(32).toString('hex'); const csrf = randomBytes(24).toString('hex');
     db.prepare('DELETE FROM sessions WHERE expires < ?').run(Date.now());
     db.prepare('INSERT INTO sessions VALUES (?,?,?,?)').run(hash(token), user.id, csrf, Date.now() + 8 * 60 * 60 * 1000);
-    respond(res, 200, { user: safeUser(user), csrf, workspace: getSettings(), standards: STANDARD_CATALOG, memoGuide: MEMO_GUIDE_PUBLIC, sectionStatuses: SECTION_STATUSES }, {
+    respond(res, 200, { user: safeUser(user), csrf, workspace: getSettings(), standards: STANDARD_CATALOG, memoGuide: MEMO_GUIDE_PUBLIC, sectionStatuses: SECTION_STATUSES, completionChecklist: COMPLETION_CHECKLIST }, {
       'Set-Cookie': `advisory_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${secureCookie ? '; Secure' : ''}`
     });
   }
@@ -271,7 +296,7 @@ export async function createApp(options = {}) {
       db.prepare('INSERT INTO resources (id, project_id, name, kind, size, content, text, created_by, created) VALUES (?,?,?,?,?,?,?,?,?)').run(randomUUID(), project.id, 'Engagement brief.md', 'reference', contents.length, contents, contents.toString(), user.id, now());
       if (i < 4) {
         const kind = i === 1 || i === 2 ? 'deck' : 'memo';
-        const params = kind === 'memo' ? { gaap: f[3], standards: [STANDARD_CATALOG[f[3]][i === 0 ? 3 : 7]], problem: f[4] } : { deckType: 'Proposal', area: i === 1 ? 'GAAP transition' : 'IPO', problem: f[4], ipoTrack: i === 2 ? 'Readiness' : '', currentGaap: i === 1 ? 'Other' : '', targetGaap: 'Ind AS' };
+        const params = kind === 'memo' ? { gaap: f[3], standards: [STANDARD_CATALOG[f[3]].find(s => s.startsWith(i === 0 ? 'IFRS 15 ' : 'ASC 842 '))], problem: f[4] } : { deckType: 'Proposal', area: i === 1 ? 'GAAP transition' : 'IPO', problem: f[4], ipoTrack: i === 2 ? 'Readiness' : '', currentGaap: i === 1 ? 'Other' : '', targetGaap: 'Ind AS' };
         const draft = buildDraft({ kind, title: f[0], params, project, resources: [], author: user.name });
         const isFinalVal = i === 2 ? 1 : 0;
         const workstreamId = randomUUID();
@@ -344,7 +369,7 @@ export async function createApp(options = {}) {
       }
       const user = session(req);
       if (!['GET', 'HEAD'].includes(method)) requireValue(req.headers['x-csrf-token'] === user.csrf, 'Your security token is invalid. Refresh and try again.', 403);
-      if (path === '/api/me' && method === 'GET') { respond(res, 200, { user: safeUser(user), csrf: user.csrf, workspace: getSettings(), standards: STANDARD_CATALOG, memoGuide: MEMO_GUIDE_PUBLIC, sectionStatuses: SECTION_STATUSES }); return; }
+      if (path === '/api/me' && method === 'GET') { respond(res, 200, { user: safeUser(user), csrf: user.csrf, workspace: getSettings(), standards: STANDARD_CATALOG, memoGuide: MEMO_GUIDE_PUBLIC, sectionStatuses: SECTION_STATUSES, completionChecklist: COMPLETION_CHECKLIST }); return; }
       if (path === '/api/me/preferences' && method === 'PATCH') {
         requireValue(!user.demo, 'Sample users do not need onboarding preferences.', 403);
         const input = await payload(req);
@@ -693,16 +718,18 @@ export async function createApp(options = {}) {
           if (method === 'PATCH' && !deliveryMatch[2]) {
             const input = await payload(req); const title = textField(input.title, 'Title', 160);
             // Memos save as sections and compose their Markdown body; a plain Markdown save clears the sections so they are re-derived from it.
-            const memo = delivery.kind === 'memo' && input.memo !== undefined ? memoField(input.memo) : null;
-            const body = memo ? composeMemo({ title, memo, project, gaap: JSON.parse(delivery.params).gaap }) : textField(input.body, 'Content', 200000);
+            const memo = delivery.kind === 'memo' && input.memo !== undefined ? memoField(input.memo, memoOf(delivery)) : null;
+            const resourceExists = id => Boolean(db.prepare('SELECT 1 FROM resources WHERE id=? AND project_id=?').get(id, project.id));
+            const params = memo && input.base !== undefined ? memoBaseField(input.base, JSON.parse(delivery.params), resourceExists) : JSON.parse(delivery.params);
+            const body = memo ? composeMemo({ title, memo, project, gaap: params.gaap }) : textField(input.body, 'Content', 200000);
             requireValue(body.length <= 200000, 'Content is too long.');
             requireValue(['Draft', 'In review', 'Approved', 'Final'].includes(input.status), 'Choose a valid review status.');
             requireValue(input.updated === delivery.updated, 'This draft was updated by someone else. Reopen it before saving.', 409);
             const isFinalVal = input.is_final !== undefined ? (input.is_final ? 1 : 0) : (input.status === 'Final' ? 1 : delivery.is_final);
             const updated = new Date(Math.max(Date.now(), Date.parse(delivery.updated) + 1)).toISOString();
             transaction(() => {
-              db.prepare('UPDATE deliverables SET title=?,body=?,memo=?,status=?,updated=?,is_final=? WHERE id=? AND project_id=?').run(
-                title, body, memo ? JSON.stringify(memo) : '', input.status, updated, isFinalVal, delivery.id, project.id
+              db.prepare('UPDATE deliverables SET title=?,params=?,body=?,memo=?,status=?,updated=?,is_final=? WHERE id=? AND project_id=?').run(
+                title, JSON.stringify(params), body, memo ? JSON.stringify(memo) : '', input.status, updated, isFinalVal, delivery.id, project.id
               );
               // Sync corresponding draft document in resources
               const draftDoc = db.prepare("SELECT id FROM resources WHERE workstream_id=? AND project_id=? AND kind='draft'").get(delivery.id, project.id);

@@ -519,6 +519,7 @@ function setSession(data) {
   state.standards = data.standards;
   state.memoGuide = data.memoGuide || [];
   state.sectionStatuses = data.sectionStatuses || ['Not started', 'Drafting', 'Ready for review'];
+  state.completionChecklist = data.completionChecklist || [];
 }
 
 async function boot() {
@@ -2525,9 +2526,94 @@ function memoSectionCard(section, index) {
   `;
 }
 
-function memoEditorLayout(memo) {
-  const { header, signoff, sections } = memo;
-  const field = (label, name, value, type = 'text') => `<label>${label}<input name="memo-${name}" type="${type}" value="${e(value || '')}" maxlength="200"></label>`;
+/* The toolkit runs in three stages: Memo Base (preface, standards, engagement
+   documents), Builder (the sections), and Review and Completion. All three live in
+   one form, so a single save covers them. */
+const MEMO_STAGES = [['base', 'Memo Base'], ['builder', 'Builder'], ['review', 'Review and Completion']];
+const READY = 'Ready for review';
+const memoField = (label, name, value, type = 'text') => `<label>${label}<input name="memo-${name}" type="${type}" value="${e(value || '')}" maxlength="200"></label>`;
+const memoCardHead = (iconName, title, text) => `<header class="memo-card-head">${icon(iconName)}<div><h3>${title}</h3><p>${text}</p></div></header>`;
+const standardCode = standard => standard.split(' · ')[0].trim().toLowerCase();
+
+function memoStageTabs() {
+  return `
+    <div class="memo-stage-tabs" role="tablist" aria-label="Memo Builder stages">
+      ${MEMO_STAGES.map(([key, label], i) => `
+        <button type="button" role="tab" class="memo-stage-tab" id="memo-tab-${key}" data-action="memo-stage" data-stage="${key}" aria-controls="memo-stage-${key}" aria-selected="false">
+          <span class="memo-stage-num">${i + 1}</span><span>${label}</span><small class="memo-stage-meta" data-stage-meta="${key}"></small>
+        </button>
+      `).join('')}
+    </div>
+  `;
+}
+
+// A dropdown of checkboxes; the chips beneath it show what is selected.
+function memoMultiSelect(name, items, empty) {
+  return `
+    <details class="memo-multi" data-multi="${name}">
+      <summary><span class="memo-multi-summary"></span>${icon('down')}</summary>
+      <div class="memo-multi-menu">
+        ${items.map(item => `<label class="checkbox-row"><input type="checkbox" name="${name}" value="${e(item.value)}" data-label="${e(item.label)}" ${item.checked ? 'checked' : ''}><span>${e(item.label)}</span></label>`).join('')}
+        <p class="memo-multi-empty" ${items.length ? 'hidden' : ''}>${e(empty)}</p>
+      </div>
+    </details>
+    <div class="memo-chips" data-chips="${name}"></div>
+  `;
+}
+
+// Saved standards match the catalog by code, so a selection survives a change to a standard's title.
+function memoStandardsSelect(gaap, selected) {
+  const catalog = state.standards[gaap] || [];
+  const codes = new Set(selected.map(standardCode));
+  const others = selected.filter(s => !catalog.some(c => standardCode(c) === standardCode(s)));
+  const items = [...catalog.map(s => ({ value: s, label: s, checked: codes.has(standardCode(s)) })), ...others.map(s => ({ value: s, label: s, checked: true }))];
+  return memoMultiSelect('base-standards', items, 'This framework has no standards catalog. Add the guidance you rely on below.');
+}
+
+function memoBaseStage(d, memo) {
+  const params = d.params;
+  const selectedDocs = new Set(params.resourceIds || []);
+  // The workstream's own drafts and exports are outputs, not source material.
+  const documents = (state.project.resources || []).filter(r => r.workstream_id !== d.id);
+  return `
+    <div class="memo-base">
+      <section class="memo-card">
+        ${memoCardHead('mail', 'Preface', 'Addressees, date, and an opening note that sits above the first section of the memo.')}
+        <div class="memo-details-grid">
+          ${memoField('To', 'to', memo.header.to)}
+          ${memoField('From', 'from', memo.header.from)}
+          ${memoField('CC', 'cc', memo.header.cc)}
+          ${memoField('Date', 'date', memo.header.date, 'date')}
+        </div>
+        <label class="memo-preface">Preface <span class="optional">Optional</span>
+          <textarea name="memo-preface" rows="3" maxlength="8000" spellcheck="true" placeholder="e.g. This memorandum documents management's assessment of the accounting for…">${e(memo.preface)}</textarea>
+        </label>
+      </section>
+      <section class="memo-card">
+        ${memoCardHead('book', 'Applicable standards', 'The framework and the authoritative guidance this memo relies on.')}
+        <div class="memo-base-grid">
+          <label>Accounting framework
+            <select name="base-gaap" id="memo-base-gaap">${options(frameworks, toolkitFramework(params.gaap))}</select>
+          </label>
+          <div class="memo-field">
+            <span class="memo-field-label">Standards</span>
+            <div id="memo-standards-field">${memoStandardsSelect(toolkitFramework(params.gaap), params.standards || [])}</div>
+            <div class="memo-add-standard">
+              <input id="memo-custom-standard" placeholder="Add another standard or topic, e.g. IFRIC 23" maxlength="500" aria-label="Add another standard or topic">
+              ${button(icon('plus') + ' Add', 'memo-add-standard', 'btn secondary small-btn')}
+            </div>
+          </div>
+        </div>
+      </section>
+      <section class="memo-card">
+        ${memoCardHead('folder', 'Engagement documents', 'Documents from this engagement that the memo relies on. They will be the source material for the AI drafting agent.')}
+        ${memoMultiSelect('base-resourceIds', documents.map(r => ({ value: r.id, label: r.name, checked: selectedDocs.has(r.id) })), 'No engagement documents yet. Upload them from the engagement dashboard.')}
+      </section>
+    </div>
+  `;
+}
+
+function memoBuilderStage(memo) {
   return `
     <div class="memo-layout">
       <aside class="memo-outline" aria-label="Memo outline">
@@ -2539,44 +2625,160 @@ function memoEditorLayout(memo) {
         ${button(icon('plus') + ' Add section', 'memo-add-section', 'btn secondary small-btn memo-add-btn')}
       </aside>
       <div class="memo-main">
-        <details class="memo-details" ${header.to ? '' : 'open'}>
-          <summary>${icon('mail')}<span>Memo details</span><small>Addressees, date, and sign-off</small></summary>
-          <div class="memo-details-grid">
-            ${field('To', 'to', header.to)}
-            ${field('From', 'from', header.from)}
-            ${field('CC', 'cc', header.cc)}
-            ${field('Date', 'date', header.date, 'date')}
-            ${field('Prepared by', 'preparer', signoff.preparer)}
-            ${field('Reviewed by', 'reviewer', signoff.reviewer)}
-            ${field('Approved by', 'approver', signoff.approver)}
+        <div class="memo-builder-bar">
+          <div class="view-toggle memo-view-toggle" role="group" aria-label="Memo view">
+            ${button(icon('list') + ' Sections', 'memo-view', 'icon-btn selected', 'data-view="sections" aria-pressed="true"')}
+            ${button(icon('eye') + ' Preview', 'memo-view', 'icon-btn', 'data-view="preview" aria-pressed="false"')}
           </div>
-        </details>
-        <div id="memo-sections">${sections.map(memoSectionCard).join('')}</div>
+        </div>
+        <div id="memo-sections">${memo.sections.map(memoSectionCard).join('')}</div>
         <div id="memo-preview" class="draft-preview memo-preview" hidden></div>
       </div>
     </div>
   `;
 }
 
+function memoReviewStage(memo) {
+  return `
+    <div class="memo-review">
+      <section class="memo-card">
+        ${memoCardHead('eye', 'Review', 'Sections marked Ready for review in the Builder, with the framework and standards the memo relies on.')}
+        <div id="memo-review-body"></div>
+      </section>
+      <section class="memo-card memo-completion" id="memo-completion">
+        ${memoCardHead('check', 'Completion checklist', 'Confirm each point before the memo is circulated.')}
+        <p class="memo-lock" id="memo-completion-lock"></p>
+        <div class="memo-checklist">
+          ${state.completionChecklist.map(item => `
+            <label class="checkbox-row memo-check"><input type="checkbox" name="memo-completion" value="${e(item.id)}" ${memo.completion?.[item.id] ? 'checked' : ''}><span>${e(item.text)}</span></label>
+          `).join('')}
+        </div>
+        <div class="memo-signoff-grid">
+          ${memoField('Prepared by', 'preparer', memo.signoff.preparer)}
+          ${memoField('Reviewed by', 'reviewer', memo.signoff.reviewer)}
+          ${memoField('Approved by', 'approver', memo.signoff.approver)}
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function memoEditorLayout(d) {
+  const stages = { base: memoBaseStage(d, d.memo), builder: memoBuilderStage(d.memo), review: memoReviewStage(d.memo) };
+  return MEMO_STAGES.map(([key]) => `<section class="memo-stage" id="memo-stage-${key}" data-stage="${key}" role="tabpanel" aria-labelledby="memo-tab-${key}" hidden>${stages[key]}</section>`).join('');
+}
+
 function collectMemo(form) {
   const field = name => form.querySelector(`[name="memo-${name}"]`)?.value.trim() || '';
   return {
     header: { to: field('to'), from: field('from'), cc: field('cc'), date: field('date') },
+    preface: field('preface'),
     signoff: { preparer: field('preparer'), reviewer: field('reviewer'), approver: field('approver') },
     sections: [...form.querySelectorAll('.memo-section')].map(card => ({
       id: card.dataset.sectionId,
       heading: card.querySelector('.memo-section-heading').value.trim(),
       body: card.querySelector('.memo-section-body').value,
       status: card.querySelector('.memo-section-status').value
-    }))
+    })),
+    completion: Object.fromEntries([...form.querySelectorAll('[name="memo-completion"]')].map(box => [box.value, box.checked]))
   };
+}
+
+function collectMemoBase(form) {
+  const checked = name => [...form.querySelectorAll(`[name="${name}"]:checked`)].map(box => box.value);
+  return { gaap: form.querySelector('[name="base-gaap"]').value, standards: checked('base-standards'), resourceIds: checked('base-resourceIds') };
 }
 
 // Save payload for the workstream editor form, whichever toolkit rendered it.
 function deliveryPayload(form) {
   const values = Object.fromEntries(new FormData(form));
   if (form.dataset.kind !== 'memo') return { title: values.title, status: values.status, body: values.body };
-  return { title: values.title, status: values.status, memo: collectMemo(form) };
+  return { title: values.title, status: values.status, memo: collectMemo(form), base: collectMemoBase(form) };
+}
+
+function showMemoStage(stage) {
+  if (!document.querySelector('.memo-stage')) return;
+  document.querySelectorAll('.memo-stage').forEach(panel => { panel.hidden = panel.dataset.stage !== stage; });
+  document.querySelectorAll('.memo-stage-tab').forEach(tab => {
+    tab.classList.toggle('selected', tab.dataset.stage === stage);
+    tab.setAttribute('aria-selected', String(tab.dataset.stage === stage));
+  });
+  // Textareas measure zero height while hidden, so size them once they are shown.
+  document.querySelectorAll(`#memo-stage-${stage} textarea`).forEach(autosize);
+  if (stage === 'review') renderMemoReview();
+  state.memoStage = { id: state.editing?.id, stage };
+}
+
+function renderMemoBase() {
+  const nouns = { 'base-standards': ['standard', 'standards'], 'base-resourceIds': ['document', 'documents'] };
+  document.querySelectorAll('.memo-multi').forEach(menu => {
+    const name = menu.dataset.multi;
+    const checked = [...menu.querySelectorAll('input:checked')];
+    const [one, many] = nouns[name];
+    menu.querySelector('.memo-multi-summary').textContent = checked.length ? `${checked.length} ${checked.length === 1 ? one : many} selected` : `Select ${many}`;
+    document.querySelector(`[data-chips="${name}"]`).innerHTML = checked.map(box => `
+      <span class="memo-chip">${e(box.dataset.label)}<button type="button" class="memo-chip-remove" data-action="memo-chip-remove" data-name="${name}" data-value="${e(box.value)}" aria-label="Remove ${e(box.dataset.label)}">${icon('close')}</button></span>
+    `).join('');
+  });
+  const standards = document.querySelectorAll('[name="base-standards"]:checked').length;
+  const meta = document.querySelector('[data-stage-meta="base"]');
+  if (meta) meta.textContent = standards ? `${standards} ${standards === 1 ? 'standard' : 'standards'}` : '';
+}
+
+function addMemoStandard() {
+  const input = document.querySelector('#memo-custom-standard');
+  const value = input?.value.trim();
+  if (!value) return;
+  const existing = [...document.querySelectorAll('[name="base-standards"]')].find(box => standardCode(box.value) === standardCode(value));
+  if (existing) existing.checked = true;
+  else {
+    const menu = document.querySelector('[data-multi="base-standards"] .memo-multi-menu');
+    menu.querySelector('.memo-multi-empty').hidden = true;
+    menu.querySelector('.memo-multi-empty').insertAdjacentHTML('beforebegin', `<label class="checkbox-row"><input type="checkbox" name="base-standards" value="${e(value)}" data-label="${e(value)}" checked><span>${e(value)}</span></label>`);
+  }
+  input.value = '';
+  renderMemoBase();
+  markMemoDirty();
+}
+
+function renderMemoReview() {
+  const target = document.querySelector('#memo-review-body');
+  if (!target) return;
+  const form = target.closest('form');
+  const memo = collectMemo(form);
+  const base = collectMemoBase(form);
+  const ready = memo.sections.map((section, i) => ({ ...section, number: i + 1 })).filter(s => s.status === READY);
+  const open = memo.sections.filter(s => s.status !== READY);
+  target.innerHTML = `
+    <dl class="memo-review-facts">
+      <div><dt>Accounting framework</dt><dd>${e(base.gaap)}</dd></div>
+      <div><dt>Selected standards</dt><dd>${base.standards.length ? `<div class="memo-chips">${base.standards.map(s => `<span class="memo-chip">${e(s)}</span>`).join('')}</div>` : 'No standards selected'}</dd></div>
+    </dl>
+    <h4 class="memo-review-subhead">Completed sections <span>${ready.length} of ${memo.sections.length}</span></h4>
+    ${ready.length ? ready.map(s => `
+      <details class="memo-review-section" open>
+        <summary><span class="memo-outline-num">${s.number}</span><span>${e(s.heading || 'Untitled section')}</span></summary>
+        <div class="draft-preview">${s.body.trim() ? markdown(s.body) : '<p>[To be completed]</p>'}</div>
+      </details>
+    `).join('') : '<p class="memo-review-empty">No sections are ready yet. Set a section to Ready for review in the Builder.</p>'}
+    ${ready.length && open.length ? `<p class="memo-review-empty">Still in the Builder: ${open.map(s => e(s.heading || 'Untitled section')).join(' · ')}</p>` : ''}
+  `;
+}
+
+// The completion checklist opens only once every Builder section is ready for review.
+function renderMemoCompletion() {
+  const panel = document.querySelector('#memo-completion');
+  if (!panel) return;
+  const statuses = [...document.querySelectorAll('.memo-section-status')].map(select => select.value);
+  const open = statuses.filter(status => status !== READY).length;
+  const locked = open > 0;
+  panel.classList.toggle('locked', locked);
+  panel.querySelectorAll('[name="memo-completion"]').forEach(box => { box.disabled = locked; });
+  document.querySelector('#memo-completion-lock').innerHTML = locked
+    ? `${icon('lock')}<span>Locked until every Builder section is Ready for review. ${open} of ${statuses.length} ${open === 1 ? 'section is' : 'sections are'} still open.</span>`
+    : `${icon('check')}<span>All ${statuses.length} sections are ready for review. Complete the checklist below.</span>`;
+  const boxes = [...panel.querySelectorAll('[name="memo-completion"]')];
+  document.querySelector('[data-stage-meta="review"]').textContent = `${boxes.filter(box => box.checked).length}/${boxes.length} checked`;
 }
 
 function renderMemoOutline() {
@@ -2599,6 +2801,8 @@ function renderMemoOutline() {
   document.querySelector('.memo-progress-ready').style.width = `${cards.length ? ready / cards.length * 100 : 0}%`;
   document.querySelector('.memo-progress-drafting').style.width = `${cards.length ? drafting / cards.length * 100 : 0}%`;
   document.querySelector('[data-action="memo-add-section"]').disabled = cards.length >= MEMO_MAX_SECTIONS;
+  document.querySelector('[data-stage-meta="builder"]').textContent = `${ready}/${cards.length} ready`;
+  renderMemoCompletion();
 }
 
 function autosize(textarea) {
@@ -2620,14 +2824,13 @@ function showMemoView(view) {
   if (view === 'preview') {
     const memo = collectMemo(form);
     const header = [['To', memo.header.to], ['From', memo.header.from], ['CC', memo.header.cc], ['Date', memo.header.date]].filter(([, v]) => v).map(([k, v]) => `${k}: ${v}`);
-    const body = [`# ${form.querySelector('[name="title"]').value}`, ...header,
+    const body = [`# ${form.querySelector('[name="title"]').value}`, ...header, ...(memo.preface ? ['', memo.preface] : []),
       ...memo.sections.map((s, i) => `## ${i + 1}. ${s.heading || 'Untitled section'}\n${s.body.trim() || '[To be completed]'}`),
       `## ${memo.sections.length + 1}. Review and sign-off\n- Prepared by: ${memo.signoff.preparer || '[Pending]'}\n- Reviewed by: ${memo.signoff.reviewer || '[Pending]'}\n- Approved by: ${memo.signoff.approver || '[Pending]'}`].join('\n');
     preview.innerHTML = markdown(body);
   }
   preview.hidden = view !== 'preview';
   document.querySelector('#memo-sections').hidden = view === 'preview';
-  document.querySelector('.memo-details').hidden = view === 'preview';
   document.querySelectorAll('[data-action="memo-view"]').forEach(b => {
     b.classList.toggle('selected', b.dataset.view === view);
     b.setAttribute('aria-pressed', String(b.dataset.view === view));
@@ -2656,9 +2859,10 @@ function removeMemoSection(id) {
   markMemoDirty();
 }
 
-function initMemoEditor() {
-  document.querySelectorAll('.memo-section-body').forEach(autosize);
+function initMemoEditor(d) {
   renderMemoOutline();
+  renderMemoBase();
+  showMemoStage(state.memoStage?.id === d.id ? state.memoStage.stage : 'base');
 }
 
 async function editDelivery(project, id) {
@@ -2714,12 +2918,7 @@ async function renderWorkstream(project, id) {
         </div>
 
         <div class="editor-toolbar">
-          ${isMemo ? `
-            <div class="view-toggle memo-view-toggle" role="group" aria-label="Memo view">
-              ${button(icon('list') + ' Sections', 'memo-view', 'icon-btn selected', 'data-view="sections" aria-pressed="true"')}
-              ${button(icon('eye') + ' Preview', 'memo-view', 'icon-btn', 'data-view="preview" aria-pressed="false"')}
-            </div>
-          ` : `<span>${icon('slides')} Executive Presentation · Live Markdown Preview</span>`}
+          ${isMemo ? memoStageTabs() : `<span>${icon('slides')} Executive Presentation · Live Markdown Preview</span>`}
           <div class="button-row">
             <button type="button" class="btn secondary small-btn" data-action="save-export-to-documents" data-project="${project}" data-id="${id}" title="Save ${d.kind === 'memo' ? '.docx' : '.pptx'} export directly to Engagement Documents">
               ${icon('upload')} Save ${d.kind === 'memo' ? 'Word (.docx)' : 'Deck (.pptx)'} to Documents
@@ -2731,7 +2930,7 @@ async function renderWorkstream(project, id) {
           </div>
         </div>
 
-        ${isMemo ? memoEditorLayout(d.memo) : `
+        ${isMemo ? memoEditorLayout(d) : `
         <div class="editor-grid">
           <label class="editor-input-label">
             <span class="sr-only">Deliverable content</span>
@@ -2776,7 +2975,7 @@ async function renderWorkstream(project, id) {
       ${content}
     </div>
   `, 'Engagement Manager', `${p.name} / ${toolkit}`);
-  if (isMemo && !pending) initMemoEditor();
+  if (isMemo && !pending) initMemoEditor(d);
 }
 
 function addMember() {
@@ -3088,6 +3287,15 @@ document.addEventListener('click', async event => {
           target.textContent = state.editing.kind === 'memo' ? 'Create memo outline' : 'Create deck outline';
         }
       }
+    } else if (action === 'memo-stage') {
+      showMemoStage(target.dataset.stage);
+    } else if (action === 'memo-add-standard') {
+      addMemoStandard();
+    } else if (action === 'memo-chip-remove') {
+      const box = [...document.querySelectorAll(`[name="${target.dataset.name}"]`)].find(input => input.value === target.dataset.value);
+      if (box) box.checked = false;
+      renderMemoBase();
+      markMemoDirty();
     } else if (action === 'memo-view') {
       showMemoView(target.dataset.view);
     } else if (action === 'memo-add-section') {
@@ -3216,6 +3424,9 @@ document.addEventListener('input', event => {
     markMemoDirty();
     if (event.target.matches('.memo-section-body')) autosize(event.target);
     if (event.target.matches('.memo-section-heading, .memo-section-status')) renderMemoOutline();
+    if (event.target.matches('[name="memo-preface"]')) autosize(event.target);
+    if (event.target.closest('.memo-multi')) renderMemoBase();
+    if (event.target.matches('[name="memo-completion"]')) renderMemoCompletion();
   }
   if (event.target.id === 'draft-body') {
     const preview = document.querySelector('#draft-preview');
@@ -3228,10 +3439,24 @@ document.addEventListener('input', event => {
 // A blank section heading fails validation; make sure it is visible so the browser can point to it.
 document.addEventListener('invalid', event => {
   if (event.target.closest('.memo-editor')) {
+    showMemoStage(event.target.closest('.memo-stage')?.dataset.stage || 'builder');
     showMemoView('sections');
     event.target.closest('.memo-section')?.classList.remove('collapsed');
   }
 }, true);
+
+// Memo Base dropdowns close when focus moves elsewhere on the page.
+document.addEventListener('click', event => {
+  document.querySelectorAll('.memo-multi[open]').forEach(menu => { if (!menu.contains(event.target)) menu.open = false; });
+});
+
+// Enter in the extra-standard field adds it rather than submitting the memo.
+document.addEventListener('keydown', event => {
+  if (event.key === 'Enter' && event.target.id === 'memo-custom-standard') {
+    event.preventDefault();
+    addMemoStandard();
+  }
+});
 
 window.addEventListener('beforeunload', event => {
   if (document.querySelector('#edit-delivery-form[data-dirty="true"]')) event.preventDefault();
@@ -3251,6 +3476,12 @@ document.addEventListener('change', async event => {
       renderProjectResults();
     } else if (target.id === 'project-sort') {
       renderProjectResults();
+    } else if (target.id === 'memo-base-gaap') {
+      // Keep only the hand-added standards; catalog picks belong to the previous framework.
+      const catalogCodes = new Set(Object.values(state.standards).flat().map(standardCode));
+      const custom = [...document.querySelectorAll('[name="base-standards"]:checked')].map(box => box.value).filter(s => !catalogCodes.has(standardCode(s)));
+      document.querySelector('#memo-standards-field').innerHTML = memoStandardsSelect(target.value, custom);
+      renderMemoBase();
     } else if (target.id === 'memo-gaap') {
       document.querySelector('#standards-options').innerHTML = standardsCheckboxes(target.value);
     } else if (target.id === 'deck-type') {
