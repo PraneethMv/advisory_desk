@@ -848,6 +848,26 @@ test('workstreams finalised before Final Deliverables held documents become fina
   }
 });
 
+test('invite-only signup and proxy-aware sign-in limits for public exposure', async () => {
+  const dir = await mkdtemp(resolve('test-results', 'public-'));
+  const publicApp = await createApp({ dataDir: dir, requireInvite: true, trustProxy: true });
+  try {
+    await new Promise(done => publicApp.server.listen(0, '127.0.0.1', done));
+    const base = `http://127.0.0.1:${publicApp.server.address().port}/api`;
+    const post = (path, value, extra = {}) => fetch(`${base}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...extra }, body: JSON.stringify(value) });
+    assert.equal((await (await fetch(`${base}/auth/status`)).json()).requireInvite, true);
+    assert.equal((await post('/auth/signup', { name: 'Owner', email: 'owner@example.test', password: 'correct horse battery staple' })).status, 200, 'First account needs no invite');
+    assert.equal((await post('/auth/signup', { name: 'Walk-in', email: 'walkin@example.test', password: 'walk-in password long enough' })).status, 403);
+    const login = forwardedFor => post('/auth/login', { email: 'owner@example.test', password: 'wrong password entirely' }, { 'X-Forwarded-For': forwardedFor });
+    for (let i = 0; i < 30; i++) await login('203.0.113.7');
+    assert.equal((await login('203.0.113.7')).status, 429);
+    assert.equal((await login('198.51.100.9')).status, 401, 'Another visitor behind the same proxy is not locked out');
+  } finally {
+    await publicApp.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('memo builder stores ordered sections, composes the Markdown body, and exports a structured memo', async () => {
   const owner = client();
   await owner.request('/auth/login', 'POST', { email: 'owner@example.test', password: 'correct horse battery staple' });

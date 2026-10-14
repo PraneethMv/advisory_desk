@@ -249,6 +249,10 @@ export async function createApp(options = {}) {
   const limiters = new Map();
   const secureCookie = options.secureCookie ?? process.env.ADVISORY_SECURE_COOKIE === '1';
   const allowDemo = options.allowDemo ?? process.env.ADVISORY_ALLOW_DEMO !== '0';
+  const requireInvite = options.requireInvite ?? process.env.ADVISORY_REQUIRE_INVITE === '1';
+  // Behind a local reverse proxy (e.g. Tailscale Funnel) every request arrives from loopback,
+  // so rate limits key on the client address the proxy appends to X-Forwarded-For.
+  const trustProxy = options.trustProxy ?? process.env.ADVISORY_TRUST_PROXY === '1';
   const expectedOrigin = options.origin || process.env.ADVISORY_ORIGIN || '';
   const headers = {
     'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'same-origin',
@@ -286,7 +290,8 @@ export async function createApp(options = {}) {
     catch (error) { if (error instanceof ApiError) throw error; throw new ApiError(400, 'Invalid JSON.'); }
   }
   function throttle(req) {
-    const key = req.socket.remoteAddress;
+    const forwarded = trustProxy ? String(req.headers['x-forwarded-for'] || '').split(',').pop().trim() : '';
+    const key = forwarded || req.socket.remoteAddress;
     if (limiters.size > 5000) { for (const [k, v] of limiters) if (v.until < Date.now()) limiters.delete(k); }
     const entry = limiters.get(key) || { count: 0, until: Date.now() + 600000 };
     if (entry.until < Date.now()) { entry.count = 0; entry.until = Date.now() + 600000; }
@@ -362,7 +367,7 @@ export async function createApp(options = {}) {
         res.writeHead(200, { ...headers, 'Content-Type': `${file[1]}; charset=utf-8` }); res.end(method === 'HEAD' ? undefined : bytes); return;
       }
       if (path === '/api/auth/status' && method === 'GET') {
-        respond(res, 200, { needsSetup: !db.prepare('SELECT id FROM users WHERE demo=0 LIMIT 1').get(), allowDemo: allowDemo && ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress) }); return;
+        respond(res, 200, { needsSetup: !db.prepare('SELECT id FROM users WHERE demo=0 LIMIT 1').get(), requireInvite, allowDemo: allowDemo && ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress) }); return;
       }
       if (path === '/api/auth/signup' && method === 'POST') {
         throttle(req); const input = await payload(req);
@@ -372,6 +377,7 @@ export async function createApp(options = {}) {
           const first = !db.prepare('SELECT id FROM users WHERE demo=0 LIMIT 1').get();
           if (first) requireValue(['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress) && /^(127\.0\.0\.1|localhost|\[::1\]):\d+$/.test(req.headers.host), 'Create the first super-user account from localhost before opening the workspace to the team.', 403);
           let invite;
+          requireValue(first || input.invite || !requireInvite, 'A team invitation code is required to create an account.', 403);
           if (!first && input.invite) {
             invite = db.prepare('SELECT * FROM invitations WHERE token=? AND email=? AND used=0 AND expires>?').get(hash(textField(input.invite, 'Team invitation code')), email, Date.now());
             requireValue(invite, 'A valid invitation for this email is required.', 403);

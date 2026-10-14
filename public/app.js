@@ -604,9 +604,15 @@ function renderAuth() {
           </label>
           
           ${signup && !first ? `
-            <label class="auth-field">Team invitation code <span class="optional">Optional</span>
-              <input name="invite" autocomplete="off" placeholder="Leave blank for standard access">
-            </label>
+            ${state.authStatus.requireInvite ? `
+              <label class="auth-field">Team invitation code
+                <input name="invite" autocomplete="off" placeholder="Code from your workspace administrator" required>
+              </label>
+            ` : `
+              <label class="auth-field">Team invitation code <span class="optional">Optional</span>
+                <input name="invite" autocomplete="off" placeholder="Leave blank for standard access">
+              </label>
+            `}
           ` : ''}
 
           ${signup && first ? `
