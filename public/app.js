@@ -165,7 +165,28 @@ function toggleWorkstreamMenu(trigger) {
       <button type="button" role="menuitem" class="workstream-menu-item destructive" data-action="delete-workstream" ${attrs} data-name="${e(delivery.title)}">${icon('trash')} Delete</button>
     ` : ''}
   `;
-  workstreamMenu.setAttribute('aria-label', `Actions for ${delivery.title}`);
+  openActionsMenu(trigger, `Actions for ${delivery.title}`);
+}
+
+// Team & access row actions share the floating workstream menu.
+function toggleTeamMenu(trigger) {
+  const wasOpen = workstreamMenuTrigger === trigger && !workstreamMenu.hidden;
+  closeWorkstreamMenu();
+  if (wasOpen) return;
+  const member = state.settingsData?.users.find(u => u.id === trigger.dataset.id);
+  if (!member) return;
+  const attrs = `data-id="${e(member.id)}" data-name="${e(member.name)}"`;
+  workstreamMenu.innerHTML = `
+    ${member.active ? `<button type="button" role="menuitem" class="workstream-menu-item" data-action="issue-reset" ${attrs}>${icon('lock')} Reset password</button>` : ''}
+    ${member.active
+      ? `<button type="button" role="menuitem" class="workstream-menu-item destructive" data-action="deactivate-user" ${attrs}>${icon('close')} Deactivate account</button>`
+      : `<button type="button" role="menuitem" class="workstream-menu-item" data-action="reactivate-user" ${attrs}>${icon('check')} Reactivate account</button>`}
+  `;
+  openActionsMenu(trigger, `Actions for ${member.name}`);
+}
+
+function openActionsMenu(trigger, label) {
+  workstreamMenu.setAttribute('aria-label', label);
   workstreamMenuTrigger = trigger;
   workstreamMenu.hidden = false;
   trigger.setAttribute('aria-expanded', 'true');
@@ -1712,14 +1733,12 @@ function renderEngagementSetup(isModal = false) {
                 return `
                   <tr>
                     <td class="team-member-name-cell">
-                      <div style="display:flex;align-items:center;gap:10px;">
+                      <div class="team-person">
                         <span class="avatar small">${e(initials(m.name))}</span>
-                        <div>
-                          <strong style="display:block;font-size:13.5px;color:var(--text-primary);">${e(m.name)} ${isSelf ? '<span class="you-pill">(you)</span>' : ''}</strong>
-                        </div>
+                        <strong>${e(m.name)} ${isSelf ? '<span class="you-pill">(you)</span>' : ''}</strong>
                       </div>
                     </td>
-                    <td class="team-member-email-cell" style="font-family:var(--font-mono);font-size:12.5px;color:var(--text-muted);">${e(m.email)}</td>
+                    <td class="team-member-email-cell">${e(m.email)}</td>
                     <td class="team-member-designation-cell">
                       <span class="designation-pill">${e(memberDesignation)}</span>
                     </td>
@@ -2142,6 +2161,13 @@ function aiSettingsPanel(settings, health) {
   `;
 }
 
+// The team endpoint takes the full account state, so unchanged fields are sent as they are.
+async function updateTeamMember(id, changes) {
+  const member = state.settingsData.users.find(u => u.id === id);
+  await send(`/team/${id}`, { role: member.role, active: Boolean(member.active), ...changes }, 'PATCH');
+  await renderSettings();
+}
+
 async function renderSettings() {
   if (state.user.role !== 'super_user' || state.user.demo) {
     location.hash = '#desk';
@@ -2210,43 +2236,69 @@ async function renderSettings() {
   } else {
     content = `
       <section class="panel invite-panel">
-        <div style="margin-bottom:16px;">
+        <div class="invite-heading">
           <h2>Invite Teammates</h2>
-          <p style="font-size:12.5px;color:var(--text-muted);margin-top:2px;">Generate an email-bound invitation code. Codes expire in 7 days.</p>
+          <p>Generate an email-bound invitation code. Codes expire in 7 days.</p>
         </div>
-        <form id="invite-form" style="display:flex;gap:12px;flex-wrap:wrap;">
-          <input type="email" name="email" id="invite-email" placeholder="teammate@yourfirm.com" required style="flex:1;min-width:240px;">
+        <form id="invite-form" class="invite-form">
+          <input type="email" name="email" id="invite-email" placeholder="teammate@yourfirm.com" aria-label="Teammate email" required>
           <button type="submit" class="btn primary">${icon('plus')} Create invitation</button>
-          <div class="form-error" role="alert" style="width:100%;"></div>
+          <div class="form-error" role="alert"></div>
         </form>
-        <div id="invite-result" style="margin-top:16px;"></div>
+        <div id="invite-result" class="invite-result"></div>
       </section>
 
       <section class="panel">
         <div class="panel-heading">
           <h2>Registered Team Members <span class="count-bubble">${users.length}</span></h2>
         </div>
-        <div class="admin-team-list" style="display:flex;flex-direction:column;gap:12px;">
-          ${users.map(u => `
-            <form class="admin-team-row" data-form="team-update" data-id="${u.id}" style="display:flex;align-items:center;gap:14px;padding:12px 16px;background:var(--bg-surface-variant);border:1px solid var(--outline);border-radius:var(--radius-md);flex-wrap:wrap;">
-              <span class="avatar">${e(initials(u.name))}</span>
-              <div style="flex:1;min-width:180px;">
-                <strong>${e(u.name)} ${u.id === state.user.id ? '<span style="color:var(--brand-blue);font-size:11px;">(you)</span>' : ''}</strong>
-                <small style="display:block;color:var(--text-muted);">${e(u.email)}</small>
-              </div>
-              <select name="role" id="role-${u.id}" ${u.id === state.user.id ? 'disabled' : ''}>
-                ${options(['member', 'super_user'], u.role)}
-              </select>
-              <label style="display:flex;flex-direction:row;align-items:center;gap:6px;font-size:12px;">
-                <input type="checkbox" name="active" ${u.active ? 'checked' : ''} ${u.id === state.user.id ? 'disabled' : ''}> Active
-              </label>
-              ${u.id !== state.user.id ? `
-                ${u.active ? button(`${icon('lock')} Reset password`, 'issue-reset', 'btn secondary small-btn', `data-id="${u.id}" data-name="${e(u.name)}"`) : ''}
-                <button type="submit" class="btn secondary small-btn">Save</button>
-              ` : '<span class="role-tag">Super user</span>'}
-              <div class="form-error" role="alert" style="width:100%;"></div>
-            </form>
-          `).join('')}
+        <div class="team-table-wrap">
+          <table class="team-table admin-team-table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Email ID</th>
+                <th>User type</th>
+                <th>Tags</th>
+                <th><span class="sr-only">Actions</span></th>
+              </tr>
+            </thead>
+            <tbody>
+              ${users.map(u => {
+                const isSelf = u.id === state.user.id;
+                return `
+                  <tr class="${u.active ? '' : 'inactive-row'}">
+                    <td class="team-member-name-cell">
+                      <div class="team-person">
+                        <span class="avatar small">${e(initials(u.name))}</span>
+                        <strong>${e(u.name)} ${isSelf ? '<span class="you-pill">(you)</span>' : ''}</strong>
+                      </div>
+                    </td>
+                    <td class="team-member-email-cell">${e(u.email)}</td>
+                    <td>
+                      <select class="member-role-select" data-action="change-user-type" data-id="${u.id}" aria-label="User type for ${e(u.name)}" ${isSelf ? 'disabled title="You cannot change your own user type"' : ''}>
+                        <option value="member" ${u.role === 'member' ? 'selected' : ''}>Member</option>
+                        <option value="super_user" ${u.role === 'super_user' ? 'selected' : ''}>Super user</option>
+                      </select>
+                    </td>
+                    <td>
+                      <div class="team-tags">
+                        ${u.role === 'super_user' ? '<span class="role-pill role-engagement-manager">Super user</span>' : '<span class="role-pill role-team-member">Member</span>'}
+                        ${u.active ? '' : '<span class="role-pill role-inactive">Inactive</span>'}
+                      </div>
+                    </td>
+                    <td style="text-align:right;">
+                      ${isSelf ? '' : `
+                        <button type="button" class="quiet-ghost-action workstream-menu-trigger" data-action="toggle-team-menu" data-id="${u.id}" aria-label="Actions for ${e(u.name)}" aria-haspopup="menu" aria-expanded="false" aria-controls="workstream-actions-menu" title="Account actions">
+                          ${icon('more')}
+                        </button>
+                      `}
+                    </td>
+                  </tr>
+                `;
+              }).join('')}
+            </tbody>
+          </table>
         </div>
       </section>
     `;
@@ -3296,6 +3348,25 @@ document.addEventListener('click', async event => {
       location.hash = '#project-setup';
     } else if (action === 'toggle-workstream-menu') {
       toggleWorkstreamMenu(target);
+    } else if (action === 'toggle-team-menu') {
+      toggleTeamMenu(target);
+    } else if (action === 'deactivate-user') {
+      showModal(
+        `Deactivate ${target.dataset.name}?`,
+        'They are signed out now and cannot sign in until a super user reactivates the account. Their projects and work are kept.',
+        `
+          <form id="team-status-form" data-id="${e(target.dataset.id)}">
+            <div class="form-error" role="alert"></div>
+            <div class="modal-actions">
+              ${button('Cancel', 'close-modal', 'btn secondary')}
+              <button type="submit" class="btn danger">Deactivate account</button>
+            </div>
+          </form>
+        `
+      );
+    } else if (action === 'reactivate-user') {
+      await updateTeamMember(target.dataset.id, { active: true });
+      toast(`${target.dataset.name} can sign in again.`);
     } else if (action === 'toggle-user-menu') {
       const dropdown = target.closest('.user-menu-wrap')?.querySelector('.user-menu-dropdown');
       if (dropdown) {
@@ -3568,8 +3639,8 @@ document.addEventListener('click', async event => {
         'Share this code with them directly, e.g. in person or by phone. It is shown only once.',
         `
           <div class="form-stack">
-            <div style="display:flex;gap:10px;align-items:center;">
-              <input id="reset-code" value="${e(result.code)}" readonly style="font-family:var(--font-mono);font-size:13px;flex:1;" aria-label="Reset code">
+            <div class="code-row">
+              <input id="reset-code" value="${e(result.code)}" readonly aria-label="Reset code">
               ${button('Copy code', 'copy-invite', 'btn secondary small-btn', 'data-input="reset-code"')}
             </div>
             <div class="inline-note">
@@ -3693,6 +3764,14 @@ document.addEventListener('change', async event => {
       if (subSelect) {
         const subList = engagementSubTypes[target.value] || ['General'];
         subSelect.innerHTML = subList.map(s => `<option value="${e(s)}">${e(s)}</option>`).join('');
+      }
+    } else if (target.dataset.action === 'change-user-type') {
+      try {
+        await updateTeamMember(target.dataset.id, { role: target.value });
+        toast(target.value === 'super_user' ? 'Promoted to super user.' : 'Changed to member.');
+      } catch (error) {
+        await renderSettings();
+        throw error;
       }
     } else if (target.dataset.action === 'change-member-role') {
       const memberId = target.dataset.memberId;
@@ -3910,14 +3989,14 @@ document.addEventListener('submit', async event => {
     } else if (form.id === 'invite-form') {
       const result = await send('/invitations', values);
       document.querySelector('#invite-result').innerHTML = `
-        <div style="background:var(--brand-blue-tint);border:1px solid var(--brand-blue-container);border-radius:var(--radius-md);padding:18px;">
-          <strong style="color:var(--brand-blue);display:block;margin-bottom:6px;">Invitation ready for ${e(result.email)}</strong>
-          <p style="font-size:12px;color:var(--text-secondary);margin-bottom:12px;">Share this code securely with your teammate. It will expire in 7 days.</p>
-          <div style="display:flex;gap:10px;align-items:center;">
-            <input id="invitation-code" value="${e(result.code)}" readonly style="font-family:var(--font-mono);font-size:13px;flex:1;">
+        <div class="code-card">
+          <strong>Invitation ready for ${e(result.email)}</strong>
+          <p>Share this code securely with your teammate. It will expire in 7 days.</p>
+          <div class="code-row">
+            <input id="invitation-code" value="${e(result.code)}" readonly aria-label="Invitation code">
             ${button('Copy code', 'copy-invite', 'btn secondary small-btn')}
           </div>
-          <small style="color:var(--text-muted);font-size:11px;display:block;margin-top:8px;">This code is displayed only once.</small>
+          <small>This code is displayed only once.</small>
         </div>
       `;
       toast('Invitation code generated.');
@@ -3926,11 +4005,10 @@ document.addEventListener('submit', async event => {
       await send('/me/password', { currentPassword: values.currentPassword, newPassword: values.newPassword });
       finishModal();
       toast('Password updated.');
-    } else if (form.dataset.form === 'team-update') {
-      await send(`/team/${form.dataset.id}`, { role: values.role, active: data.has('active') }, 'PATCH');
-      state.busy = false;
-      await renderSettings();
-      toast('Team access permissions updated.');
+    } else if (form.id === 'team-status-form') {
+      await updateTeamMember(form.dataset.id, { active: false });
+      finishModal();
+      toast('Account deactivated.');
     }
   } catch (error) {
     if (errorNode?.isConnected) errorNode.textContent = error.message;
