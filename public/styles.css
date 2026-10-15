@@ -5663,6 +5663,249 @@ textarea {
   gap: 10px;
 }
 
+/* Draft with AI: the bar above each section's text and the suggestion card */
+.memo-ai-bar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 8px;
+}
+
+.memo-ai-bar .btn .icon {
+  color: var(--brand-blue);
+}
+
+.memo-ai-slot[hidden] {
+  display: none;
+}
+
+.ai-draft-card {
+  margin-bottom: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--brand-blue-container);
+  border-radius: var(--radius-md);
+  background: var(--brand-blue-tint);
+}
+
+.ai-draft-card.failed {
+  border-color: color-mix(in srgb, var(--destructive) 30%, transparent);
+  background: var(--bg-surface-variant);
+}
+
+.ai-draft-card > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.ai-draft-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--brand-blue);
+}
+
+.ai-draft-title small {
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
+.ai-draft-title .icon {
+  width: 16px;
+  height: 16px;
+}
+
+.ai-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  margin: 12px 0 4px;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.ai-steps li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ai-steps li > span {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--outline);
+}
+
+.ai-steps li.active {
+  font-weight: 600;
+  color: var(--brand-blue);
+}
+
+.ai-steps li.active > span {
+  background: var(--brand-blue);
+  animation: ai-pulse 1.2s ease-in-out infinite;
+}
+
+.ai-steps li.done {
+  color: var(--success);
+}
+
+.ai-steps li.done .icon {
+  width: 13px;
+  height: 13px;
+}
+
+@keyframes ai-pulse {
+  50% { opacity: 0.3; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ai-steps li.active > span { animation: none; }
+}
+
+.ai-draft-wait {
+  margin-top: 10px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
+.ai-draft-caution,
+.ai-draft-warning {
+  display: flex;
+  gap: 7px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.ai-draft-warning {
+  color: var(--destructive);
+}
+
+.ai-draft-caution .icon,
+.ai-draft-warning .icon {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  margin-top: 1px;
+}
+
+.ai-draft-text {
+  margin-top: 10px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  font-size: 13.5px;
+  line-height: 1.6;
+}
+
+.ai-draft-text p + p {
+  margin-top: 8px;
+}
+
+.ai-draft-text.partial {
+  color: var(--text-secondary);
+}
+
+.cite-chip {
+  display: inline-block;
+  margin: 0 1px;
+  padding: 0 5px;
+  border: none;
+  border-radius: 4px;
+  background: var(--brand-blue-container);
+  color: var(--brand-blue);
+  font: inherit;
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 1.6;
+  vertical-align: 1px;
+  cursor: pointer;
+}
+
+.cite-chip:hover {
+  background: var(--brand-blue);
+  color: #fff;
+}
+
+.ai-missing {
+  margin-top: 10px;
+  padding: 10px 14px;
+  border-left: 3px solid #d97706;
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  font-size: 12.5px;
+}
+
+.ai-missing ul {
+  margin: 6px 0 0 18px;
+}
+
+.ai-missing li + li {
+  margin-top: 3px;
+}
+
+.ai-sources {
+  margin-top: 10px;
+  font-size: 12.5px;
+}
+
+.ai-sources summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--brand-blue);
+}
+
+.ai-sources ol {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ai-source {
+  padding: 10px 12px;
+  border: 1px solid var(--outline);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  opacity: 0.75;
+}
+
+.ai-source.cited {
+  opacity: 1;
+}
+
+.ai-source.focus {
+  border-color: var(--brand-blue);
+  box-shadow: 0 0 0 2px var(--brand-blue-container);
+}
+
+.ai-source > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ai-draft-card > footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.ai-open-points {
+  font-size: 12px;
+}
+
 /* Sources panel: a drawer on the right of the Memo Builder */
 .sources-drawer {
   position: fixed;

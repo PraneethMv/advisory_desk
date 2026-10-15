@@ -11,7 +11,8 @@ import { createOllamaProvider, aiConfigFromEnv, AIUnavailableError } from './lib
 import { extractDocument, EXTRACTOR_VERSION } from './lib/ai/extract.mjs';
 import { chunkPages, CHUNKER_VERSION, passageForEmbedding, queryForEmbedding, vectorToBlob } from './lib/ai/chunk.mjs';
 import { searchPassages } from './lib/ai/search.mjs';
-import { MEMO_GUIDE, DEFAULT_MEMO_HEADINGS, SECTION_STATUSES, COMPLETION_CHECKLIST, allSectionsReady, composeMemo, memoFromBody, normaliseMemo } from './lib/memo.mjs';
+import { DRAFT_SCHEMA, draftMessages, partialDraft, checkDraft } from './lib/ai/draft.mjs';
+import { MEMO_GUIDE, guideFor, DEFAULT_MEMO_HEADINGS, SECTION_STATUSES, COMPLETION_CHECKLIST, allSectionsReady, composeMemo, memoFromBody, normaliseMemo } from './lib/memo.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const deriveKey = promisify(scrypt);
@@ -336,6 +337,68 @@ export async function createApp(options = {}) {
     return { search_status: 'indexing', search_note: indexError ? `Waiting for the local AI runtime: ${indexError}` : `Indexing ${r.unindexed} of ${r.passage_count} passages…` };
   };
   const resourcesWithStatus = projectId => db.prepare('SELECT r.id,r.name,r.kind,r.size,r.created,r.created_by,r.workstream_id,r.is_final,r.extract_status,r.extract_note,(SELECT COUNT(*) FROM passages p WHERE p.resource_id=r.id) AS passage_count,(SELECT COUNT(*) FROM passages p WHERE p.resource_id=r.id AND (p.embed_model IS NULL OR p.embed_model<>?)) AS unindexed FROM resources r WHERE r.project_id=? ORDER BY r.created DESC').all(embedModel, projectId).map(r => ({ ...r, ...searchStatus(r) }));
+
+  // Draft with AI: jobs run one at a time in this process and belong to the user who started them.
+  // A job finds sources, streams the model's draft, then checks every citation; results are kept
+  // for 15 minutes. A server restart drops queued and running jobs.
+  const draftJobs = new Map(); const draftQueue = [];
+  let drafting = null;
+  const publicJob = job => ({
+    id: job.id, state: job.state, stage: job.stage, heading: job.heading, partial: job.partial, error: job.error, result: job.result,
+    position: job.state === 'queued' ? draftQueue.indexOf(job) + 1 : 0
+  });
+  const runDraftJob = async job => {
+    job.state = 'running'; job.stage = 'sources';
+    try {
+      let vector = null;
+      try { [vector] = await ai.embed([queryForEmbedding(job.vectorQuery)], { timeoutMs: 60000 }); } catch (error) { if (!(error instanceof AIUnavailableError)) throw error; }
+      if (job.controller.signal.aborted) throw new Error('cancelled');
+      const sources = searchPassages(db, { query: job.keywordQuery, projectId: job.projectId, resourceIds: job.resourceIds, vector, embedModel, limit: 8 });
+      if (!sources.length) {
+        job.state = 'failed';
+        job.error = 'No passages in the selected documents match this section. Check the documents chosen in Memo Base, or wait until they show Ready for search.';
+        return;
+      }
+      job.stage = 'writing';
+      let check; let retryNote = '';
+      for (let attempt = 0; attempt < 2; attempt++) {
+        job.partial = '';
+        const { content } = await ai.chatStream({
+          messages: draftMessages({ ...job.context, sources, retryNote }), format: DRAFT_SCHEMA, signal: job.controller.signal,
+          onText: text => { job.partial = partialDraft(text); }
+        });
+        job.stage = 'checking';
+        check = checkDraft(content, sources.length, job.heading);
+        if (check.ok) break;
+        retryNote = `Your previous reply was rejected: ${check.reason} Cite only S1 to S${sources.length}, and only for statements those passages support.`;
+        job.stage = 'writing';
+      }
+      if (!check.ok) { job.state = 'failed'; job.error = `${check.reason} The draft was discarded. Try again.`; return; }
+      job.result = {
+        draft: check.draft, missing: check.missing, cited: check.cited, uncited: check.uncited, model: ai.chatModel || '',
+        sources: sources.map((s, i) => ({ n: i + 1, resourceId: s.resourceId, document: s.document, page: s.page, heading: s.heading, text: s.text }))
+      };
+      job.partial = ''; job.state = 'done';
+      try { activity(job.projectId, job.userId, `AI drafted a suggestion for "${job.heading}" in ${job.context.memoTitle}`); } catch { /* project removed meanwhile */ }
+    } catch (error) {
+      if (job.controller.signal.aborted) { job.state = 'cancelled'; return; }
+      job.state = 'failed';
+      job.error = error instanceof AIUnavailableError ? `The local AI runtime is not available: ${error.message}` : 'Drafting failed. Please try again.';
+      if (!(error instanceof AIUnavailableError)) console.error('Draft with AI failed:', error.message);
+    } finally {
+      job.stage = '';
+      setTimeout(() => draftJobs.delete(job.id), 15 * 60 * 1000).unref?.();
+    }
+  };
+  const runDraftQueue = () => {
+    drafting ??= (async () => {
+      while (draftQueue.length && !stopping) {
+        const job = draftQueue.shift();
+        if (job.state === 'queued') await runDraftJob(job);
+      }
+    })().finally(() => { drafting = null; });
+    return drafting;
+  };
   kickExtraction();
   kickIndexing();
   // One-time password reset codes. The super user (or the reset-password server command) hands
@@ -922,6 +985,42 @@ export async function createApp(options = {}) {
           respond(res, 200, { ok: true, resourceId });
           return;
         }
+        const draftJobMatch = /^deliverables\/([\w-]+)\/draft-jobs(?:\/([\w-]+))?$/.exec(suffix);
+        if (draftJobMatch) {
+          const delivery = db.prepare('SELECT * FROM deliverables WHERE id=? AND project_id=?').get(draftJobMatch[1], project.id);
+          requireValue(delivery && delivery.kind === 'memo', 'Memo workstream not found.', 404);
+          if (!draftJobMatch[2] && method === 'POST') {
+            requireValue(getSettings().aiEnabled, 'Turn on AI assistance in Settings to draft with AI.', 409);
+            requireValue(![...draftJobs.values()].some(j => j.userId === user.id && ['queued', 'running'].includes(j.state)), 'You already have a draft in progress. Wait for it to finish or cancel it.', 409);
+            const input = await payload(req);
+            const heading = textField(input.heading, 'Section heading', 160);
+            const currentText = textField(input.currentText, 'Section content', 30000, false);
+            requireValue(Array.isArray(input.resourceIds) && input.resourceIds.length <= 50 && input.resourceIds.every(x => typeof x === 'string'), 'Choose valid engagement documents.');
+            const resourceIds = [...new Set(input.resourceIds)];
+            requireValue(resourceIds.length, 'Choose engagement documents in Memo Base to draft from them.');
+            requireValue(resourceIds.every(id => db.prepare('SELECT 1 FROM resources WHERE id=? AND project_id=?').get(id, project.id)), 'A selected document is outside this project or unavailable.', 403);
+            const params = JSON.parse(delivery.params);
+            const hint = guideFor(heading)?.hint || '';
+            const job = {
+              id: randomUUID(), projectId: project.id, userId: user.id, deliverableId: delivery.id, heading, resourceIds,
+              state: 'queued', stage: '', partial: '', error: '', result: null, controller: new AbortController(),
+              keywordQuery: `${heading} ${params.problem || ''}`.slice(0, 1000),
+              vectorQuery: [heading, hint, params.problem].filter(Boolean).join('. ').slice(0, 2000),
+              context: { memoTitle: delivery.title, framework: params.gaap || '', standards: params.standards || [], problem: params.problem || '', heading, hint, currentText }
+            };
+            draftJobs.set(job.id, job); draftQueue.push(job);
+            runDraftQueue();
+            respond(res, 202, { job: publicJob(job) }); return;
+          }
+          const job = draftJobMatch[2] && draftJobs.get(draftJobMatch[2]);
+          requireValue(job && job.userId === user.id && job.deliverableId === delivery.id, 'This draft is no longer available.', 404);
+          if (method === 'GET') { respond(res, 200, { job: publicJob(job) }); return; }
+          if (method === 'DELETE') {
+            if (job.state === 'queued') job.state = 'cancelled';
+            job.controller.abort();
+            respond(res, 200, { job: publicJob(job) }); return;
+          }
+        }
         const saveExportMatch = /^deliverables\/([\w-]+)\/save-to-documents$/.exec(suffix);
         if (saveExportMatch && method === 'POST') {
           const delivery = db.prepare('SELECT * FROM deliverables WHERE id=? AND project_id=?').get(saveExportMatch[1], project.id);
@@ -1005,7 +1104,7 @@ export async function createApp(options = {}) {
   return {
     server, db, issueResetCode,
     extractionIdle: async () => { while (extracting || indexing) await (extracting || indexing); },
-    close: async () => { stopping = true; clearTimeout(indexRetry); await new Promise(resolveClose => server.close(resolveClose)); await extracting; await indexing; db.close(); }
+    close: async () => { stopping = true; clearTimeout(indexRetry); for (const job of draftJobs.values()) job.controller.abort(); await new Promise(resolveClose => server.close(resolveClose)); await extracting; await indexing; await drafting; db.close(); }
   };
 }
 

@@ -2729,6 +2729,10 @@ function memoSectionCard(section, index) {
       </header>
       <div class="memo-section-content">
         ${hint ? `<p class="memo-section-hint">${icon('info')}<span>${e(hint)}</span></p>` : ''}
+        ${state.workspace?.aiEnabled ? `
+          <div class="memo-ai-bar">${button(icon('spark') + ' Draft with AI', 'section-draft', 'btn secondary small-btn memo-draft-btn', 'title="Draft this section from the documents selected in Memo Base"')}</div>
+          <div class="memo-ai-slot" data-ai-draft hidden></div>
+        ` : ''}
         <textarea class="memo-section-body" rows="4" maxlength="30000" spellcheck="true" aria-label="${e(section.heading)} content" placeholder="Write in Markdown. Use - for bullets and ### for sub-headings.">${e(section.body)}</textarea>
       </div>
     </section>
@@ -3241,6 +3245,161 @@ async function runSourceSearch() {
   }
 }
 
+/* Draft with AI: one section at a time. The suggestion appears inside the section and nothing in
+   the memo changes until Insert below or Replace is chosen. The server checks every [S#] citation
+   against the passages it gave the model before a draft is shown. */
+const draftJobsUrl = () => `/projects/${state.editingProject}/deliverables/${state.editing.id}/draft-jobs`;
+const DRAFT_STAGES = [['sources', 'Finding sources'], ['writing', 'Writing'], ['checking', 'Checking citations']];
+const sourceRef = s => `${s.document.replace(/\.(pdf|docx|md|txt|csv|json)$/i, '')}${s.page ? `, p. ${s.page}` : ''}`;
+
+// [S2] in the suggestion becomes a chip that opens that source in the list below it.
+const citationChips = (html, sources) => html.replace(/\[S(\d+)\]/g, (match, n) => {
+  const s = sources[Number(n) - 1];
+  return s ? `<button type="button" class="cite-chip" data-action="cite-source" data-n="${n}" title="${e(sourceRef(s))}">S${n}</button>` : match;
+});
+
+// For the memo text, [S1][S3] becomes a readable reference such as [Draft Revenue Agreement, p. 2; Ind AS 115, p. 14].
+const citationsForMemo = (draft, sources) => draft.replace(/(?:\[S\d+\])+/g, group => {
+  const refs = [...new Set([...group.matchAll(/\d+/g)].map(m => sources[Number(m[0]) - 1]).filter(Boolean).map(sourceRef))];
+  return refs.length ? `[${refs.join('; ')}]` : '';
+});
+
+function draftProgress(job) {
+  const current = DRAFT_STAGES.findIndex(([key]) => key === job.stage);
+  return `
+    <div class="ai-draft-card running">
+      <header>
+        <span class="ai-draft-title">${icon('spark')} Drafting “${e(job.heading)}”</span>
+        ${button('Cancel', 'section-draft-cancel', 'btn secondary small-btn', `data-job="${e(job.id)}"`)}
+      </header>
+      ${job.state === 'queued' ? `<p class="ai-draft-wait">Waiting for another draft to finish${job.position > 1 ? ` (${job.position} in line)` : ''}…</p>` : `
+        <ol class="ai-steps">
+          ${DRAFT_STAGES.map(([key, label], i) => `<li class="${i < current ? 'done' : i === current ? 'active' : ''}">${i < current ? icon('check') : '<span></span>'}${label}</li>`).join('')}
+        </ol>
+      `}
+      ${job.partial ? `<div class="ai-draft-text partial">${markdown(job.partial)}</div>` : ''}
+    </div>
+  `;
+}
+
+function draftResult(job) {
+  const { draft, missing, sources, cited, uncited, model } = job.result;
+  return `
+    <div class="ai-draft-card">
+      <header>
+        <span class="ai-draft-title">${icon('spark')} AI suggestion${model ? ` <small>· ${e(model)}</small>` : ''}</span>
+        ${button(icon('close'), 'section-draft-discard', 'icon-btn', 'aria-label="Discard suggestion" title="Discard"')}
+      </header>
+      <p class="ai-draft-caution">${icon('info')}<span>Preliminary. Check each statement against its source before relying on it.</span></p>
+      ${uncited ? `<p class="ai-draft-warning">${icon('info')}<span>${uncited} ${uncited === 1 ? 'paragraph has' : 'paragraphs have'} no citation. Treat ${uncited === 1 ? 'it' : 'them'} as unsupported until checked.</span></p>` : ''}
+      ${draft ? `<div class="ai-draft-text">${citationChips(markdown(draft), sources)}</div>` : '<p class="ai-draft-wait">The selected documents did not support a draft for this section.</p>'}
+      ${missing.length ? `
+        <div class="ai-missing">
+          <strong>Missing information</strong>
+          <ul>${missing.map(item => `<li>${e(item)}</li>`).join('')}</ul>
+        </div>
+      ` : ''}
+      <details class="ai-sources">
+        <summary>Sources · ${cited.length} of ${sources.length} cited</summary>
+        <ol>
+          ${sources.map(s => `
+            <li class="ai-source ${cited.includes(s.n) ? 'cited' : ''}" data-source="${s.n}">
+              <div><span class="source-rank">${s.n}</span><strong>${e(s.document)}</strong>${s.page ? `<span class="source-page">p. ${s.page}</span>` : ''}</div>
+              ${s.heading ? `<p class="source-heading">${e(s.heading)}</p>` : ''}
+              <p class="source-text">${e(readablePassage(s))}</p>
+            </li>
+          `).join('')}
+        </ol>
+      </details>
+      <footer>
+        ${missing.length ? '<label class="checkbox-row ai-open-points"><input type="checkbox" checked> Add missing information as open points</label>' : '<span></span>'}
+        <div class="button-row">
+          ${button('Discard', 'section-draft-discard', 'btn secondary small-btn')}
+          ${button('Replace section text', 'section-draft-apply', 'btn secondary small-btn', 'data-mode="replace"')}
+          ${button(icon('plus') + ' Insert below', 'section-draft-apply', 'btn primary small-btn', 'data-mode="insert"')}
+        </div>
+      </footer>
+    </div>
+  `;
+}
+
+function draftFailed(job) {
+  return `
+    <div class="ai-draft-card failed">
+      <header>
+        <span class="ai-draft-title">${icon('spark')} ${job.state === 'cancelled' ? 'Draft cancelled' : 'Draft not available'}</span>
+        ${button(icon('close'), 'section-draft-discard', 'icon-btn', 'aria-label="Close" title="Close"')}
+      </header>
+      ${job.error ? `<p class="ai-draft-warning">${icon('info')}<span>${e(job.error)}</span></p>` : ''}
+      <footer><span></span>${button(icon('spark') + ' Try again', 'section-draft', 'btn secondary small-btn')}</footer>
+    </div>
+  `;
+}
+
+function showDraft(card, job) {
+  const slot = card.querySelector('[data-ai-draft]');
+  if (!slot) return;
+  slot.hidden = false;
+  slot.dataset.job = job.id || '';
+  state.sectionDrafts ??= new Map();
+  if (job.result) state.sectionDrafts.set(card.dataset.sectionId, job.result);
+  slot.innerHTML = ['queued', 'running'].includes(job.state) ? draftProgress(job) : job.state === 'done' ? draftResult(job) : draftFailed(job);
+  card.querySelector('.memo-draft-btn').disabled = ['queued', 'running'].includes(job.state);
+}
+
+async function startSectionDraft(card) {
+  const resourceIds = selectedSourceIds();
+  if (!resourceIds.length) {
+    showDraft(card, { state: 'failed', error: 'Choose engagement documents in Memo Base first. The draft is written only from those documents.' });
+    return;
+  }
+  const { job } = await send(draftJobsUrl(), {
+    heading: card.querySelector('.memo-section-heading').value.trim(),
+    currentText: card.querySelector('.memo-section-body').value,
+    resourceIds
+  });
+  showDraft(card, job);
+  pollDraft(card, job.id);
+}
+
+// Polls once a second while the job runs; stops if the section leaves the page.
+function pollDraft(card, jobId) {
+  setTimeout(async () => {
+    if (!card.isConnected || card.querySelector('[data-ai-draft]')?.dataset.job !== jobId) return;
+    try {
+      const { job } = await api(`${draftJobsUrl()}/${jobId}`);
+      if (!card.isConnected) return;
+      showDraft(card, job);
+      if (['queued', 'running'].includes(job.state)) pollDraft(card, jobId);
+    } catch (error) {
+      showDraft(card, { state: 'failed', error: error.message });
+    }
+  }, 1000);
+}
+
+function applySectionDraft(card, mode) {
+  const result = state.sectionDrafts?.get(card.dataset.sectionId);
+  if (!result) return;
+  const openPoints = card.querySelector('.ai-open-points input')?.checked && result.missing.length
+    ? `**Open points to confirm:**\n${result.missing.map(item => `- ${item}`).join('\n')}` : '';
+  const text = [citationsForMemo(result.draft, result.sources), openPoints].filter(Boolean).join('\n\n');
+  const body = card.querySelector('.memo-section-body');
+  body.value = mode === 'replace' || !body.value.trim() ? text : `${body.value.trimEnd()}\n\n${text}`;
+  const status = card.querySelector('.memo-section-status');
+  if (status.value === state.sectionStatuses[0]) status.value = 'Drafting';
+  closeSectionDraft(card);
+  autosize(body);
+  renderMemoOutline();
+  markDirty();
+}
+
+function closeSectionDraft(card) {
+  const slot = card.querySelector('[data-ai-draft]');
+  slot.hidden = true; slot.innerHTML = ''; slot.dataset.job = '';
+  state.sectionDrafts?.delete(card.dataset.sectionId);
+  card.querySelector('.memo-draft-btn').disabled = false;
+}
+
 function initMemoEditor(d) {
   renderMemoOutline();
   renderMemoBase();
@@ -3544,6 +3703,28 @@ document.addEventListener('click', async event => {
       // A section's search starts from its heading and the memo's question; the query stays editable.
       const heading = target.closest('.memo-section')?.querySelector('.memo-section-heading')?.value.trim() || '';
       openSources([heading, state.editing?.params?.problem || ''].filter(Boolean).join(': ').slice(0, 600));
+    } else if (action === 'section-draft') {
+      const card = target.closest('.memo-section');
+      card.querySelector('.memo-draft-btn').disabled = true;
+      try { await startSectionDraft(card); } catch (error) { showDraft(card, { state: 'failed', error: error.message }); }
+    } else if (action === 'section-draft-cancel') {
+      const card = target.closest('.memo-section');
+      target.disabled = true;
+      const { job } = await send(`${draftJobsUrl()}/${target.dataset.job}`, {}, 'DELETE');
+      showDraft(card, { ...job, state: 'cancelled', error: '' });
+    } else if (action === 'section-draft-apply') {
+      applySectionDraft(target.closest('.memo-section'), target.dataset.mode);
+      toast(target.dataset.mode === 'replace' ? 'Section text replaced with the AI suggestion.' : 'AI suggestion added to the section.');
+    } else if (action === 'section-draft-discard') {
+      closeSectionDraft(target.closest('.memo-section'));
+    } else if (action === 'cite-source') {
+      const card = target.closest('.ai-draft-card');
+      const list = card.querySelector('.ai-sources');
+      list.open = true;
+      const item = list.querySelector(`[data-source="${target.dataset.n}"]`);
+      card.querySelectorAll('.ai-source.focus').forEach(x => x.classList.remove('focus'));
+      item?.classList.add('focus');
+      item?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     } else if (action === 'source-expand') {
       const card = target.closest('.source-card');
       const expanded = card.classList.toggle('expanded');
@@ -3901,7 +4082,7 @@ document.addEventListener('input', event => {
     state.query = event.target.value;
     renderProjectResults();
   }
-  if (event.target.closest('#edit-delivery-form') && !event.target.matches('#memo-custom-standard')) markDirty();
+  if (event.target.closest('#edit-delivery-form') && !event.target.matches('#memo-custom-standard') && !event.target.closest('.ai-draft-card')) markDirty();
   if (event.target.matches('.document-select')) {
     const selected = document.querySelectorAll('.document-select:checked').length;
     document.querySelector('#move-to-final-btn').hidden = !selected;
