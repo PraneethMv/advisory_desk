@@ -2723,6 +2723,7 @@ function memoSectionCard(section, index) {
         <div class="memo-section-tools">
           ${button(icon('down', 'icon-flip'), 'memo-move-section', 'icon-btn', 'data-dir="-1" title="Move up" aria-label="Move section up"')}
           ${button(icon('down'), 'memo-move-section', 'icon-btn', 'data-dir="1" title="Move down" aria-label="Move section down"')}
+          ${state.workspace?.aiEnabled ? button(icon('search'), 'section-sources', 'icon-btn', 'title="Find sources for this section" aria-label="Find sources for this section"') : ''}
           ${button(icon('trash'), 'memo-delete-section', 'icon-btn subtle-danger', 'title="Delete section" aria-label="Delete section"')}
         </div>
       </header>
@@ -2838,6 +2839,7 @@ function memoBuilderStage(memo) {
             ${button(icon('list') + ' Sections', 'memo-view', 'icon-btn selected', 'data-view="sections" aria-pressed="true"')}
             ${button(icon('eye') + ' Preview', 'memo-view', 'icon-btn', 'data-view="preview" aria-pressed="false"')}
           </div>
+          ${state.workspace?.aiEnabled ? button(icon('search') + ' Sources', 'sources-toggle', 'btn secondary small-btn', 'aria-controls="sources-drawer" aria-expanded="false"') : ''}
         </div>
         <div id="memo-sections">${memo.sections.map(memoSectionCard).join('')}</div>
         <div id="memo-preview" class="draft-preview memo-preview" hidden></div>
@@ -2918,6 +2920,7 @@ function showMemoStage(stage) {
 }
 
 function renderMemoBase() {
+  renderSourceScope();
   const nouns = { 'base-standards': ['standard', 'standards'], 'base-resourceIds': ['document', 'documents'] };
   document.querySelectorAll('.memo-multi').forEach(menu => {
     const name = menu.dataset.multi;
@@ -3110,6 +3113,134 @@ function removeMemoSection(id) {
   markDirty();
 }
 
+/* Sources panel: searches the passages of the documents ticked in Memo Base (the current
+   selection, saved or not). It sits outside the memo form so searching never marks the memo as edited. */
+function sourcesDrawer() {
+  return `
+    <aside class="sources-drawer" id="sources-drawer" aria-labelledby="sources-title" hidden>
+      <header class="sources-head">
+        <div>
+          <h2 id="sources-title">${icon('search')} Sources</h2>
+          <p>Passages from the engagement documents selected in Memo Base, best match first.</p>
+        </div>
+        ${button(icon('close'), 'sources-close', 'icon-btn', 'aria-label="Close sources" title="Close"')}
+      </header>
+      <div class="sources-search">
+        <input id="sources-query" type="search" maxlength="1000" placeholder="Ask a question or enter key terms" aria-label="Search sources">
+        ${button(icon('search') + ' Search', 'sources-search', 'btn primary small-btn')}
+      </div>
+      <p class="sources-scope" id="sources-scope"></p>
+      <div class="sources-results" id="sources-results" aria-live="polite"></div>
+    </aside>
+  `;
+}
+
+const selectedSourceIds = () => [...document.querySelectorAll('[name="base-resourceIds"]:checked')].map(box => box.value);
+
+function renderSourceScope() {
+  const scope = document.querySelector('#sources-scope');
+  if (!scope) return;
+  const count = selectedSourceIds().length;
+  scope.textContent = count
+    ? `Searching ${count} ${count === 1 ? 'document' : 'documents'} selected in Memo Base.`
+    : 'No documents are selected in Memo Base. Choose them there to search.';
+}
+
+function openSources(query) {
+  const drawer = document.querySelector('#sources-drawer');
+  if (!drawer) return;
+  drawer.hidden = false;
+  document.body.classList.add('sources-open');
+  document.querySelectorAll('[data-action="sources-toggle"]').forEach(b => b.setAttribute('aria-expanded', 'true'));
+  renderSourceScope();
+  const input = drawer.querySelector('#sources-query');
+  if (query) { input.value = query; runSourceSearch(); } else input.focus();
+}
+
+function closeSources() {
+  const drawer = document.querySelector('#sources-drawer');
+  if (drawer) drawer.hidden = true;
+  document.body.classList.remove('sources-open');
+  document.querySelectorAll('[data-action="sources-toggle"]').forEach(b => b.setAttribute('aria-expanded', 'false'));
+}
+
+// Marks words that start like a query term ("convert" also marks "conversion"), escaping everything else.
+const SOURCE_STOPWORDS = new Set('the and for are was were with that this from into what when where which while will would shall should could does have has had how its their there these those than then them they your our not can may might must under whether'.split(' '));
+function highlightTerms(text, query) {
+  const stems = [...new Set((query.toLowerCase().match(/[\p{L}\p{N}]+/gu) || []).filter(t => t.length > 2 && !SOURCE_STOPWORDS.has(t)).map(t => t.slice(0, Math.max(4, t.length - 3))))];
+  if (!stems.length) return e(text);
+  const pattern = new RegExp(`(?<![\\p{L}\\p{N}])(?:${stems.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})[\\p{L}\\p{N}]*`, 'giu');
+  let out = ''; let last = 0;
+  for (const match of text.matchAll(pattern)) {
+    out += `${e(text.slice(last, match.index))}<mark>${e(match[0])}</mark>`;
+    last = match.index + match[0].length;
+  }
+  return out + e(text.slice(last));
+}
+
+// PDF passages keep the printed line breaks; join wrapped lines for reading, keep paragraph breaks.
+const readablePassage = r => r.page ? r.text.replace(/(?<!\n)\n(?!\n)/g, ' ') : r.text;
+
+// Similarity between the question and the passage, from the embedding model. Bands were set
+// from searches on real engagement documents, where relevant passages scored about 0.45–0.65.
+const meaningBand = similarity => similarity === null ? '' : similarity >= 0.5 ? 'strong' : similarity >= 0.4 ? 'moderate' : 'weak';
+
+function sourceMatch(r, query) {
+  const marked = [...new Set([...highlightTerms(r.text, query).matchAll(/<mark>([^<]+)<\/mark>/g)].map(m => m[1].toLowerCase()))];
+  const band = meaningBand(r.similarity);
+  return [
+    marked.length ? `Words: ${marked.slice(0, 4).join(', ')}${marked.length > 4 ? '…' : ''}` : '',
+    band ? `<span class="meaning-${band}">Meaning: ${band}</span>` : ''
+  ].filter(Boolean).join(' · ');
+}
+
+function sourceResults(data) {
+  const waiting = data.documents.filter(d => d.status !== 'searchable');
+  const notices = [
+    data.note,
+    ...waiting.map(d => `${d.name}: ${(READ_STATUS[d.status] || READ_STATUS.pending)[0]}. ${d.status === 'indexing' ? 'Some of its passages may not be found yet.' : 'Its text cannot be searched.'}`)
+  ].filter(Boolean);
+  return `
+    ${notices.map(text => `<p class="sources-notice">${icon('info')}<span>${e(text)}</span></p>`).join('')}
+    ${data.results.length ? data.results.map((r, i) => `
+      <article class="source-card">
+        <header>
+          <span class="source-rank">${i + 1}</span>
+          <strong title="${e(r.document)}">${e(r.document)}</strong>
+          ${r.page ? `<span class="source-page">p. ${r.page}</span>` : ''}
+        </header>
+        ${r.heading ? `<p class="source-heading">${e(r.heading)}</p>` : ''}
+        <p class="source-text">${highlightTerms(readablePassage(r), data.query)}</p>
+        <footer>
+          <span class="source-match">${sourceMatch(r, data.query)}</span>
+          ${button('Show full passage', 'source-expand', 'source-expand')}
+        </footer>
+      </article>
+    `).join('') : '<p class="sources-empty">No matching passages in the selected documents. Try other words, or check the documents chosen in Memo Base.</p>'}
+  `;
+}
+
+let sourceSearchSeq = 0;
+async function runSourceSearch() {
+  const input = document.querySelector('#sources-query');
+  const results = document.querySelector('#sources-results');
+  const query = input?.value.trim();
+  if (!query) return;
+  const resourceIds = selectedSourceIds();
+  if (!resourceIds.length) {
+    results.innerHTML = '<p class="sources-empty">Choose engagement documents in Memo Base first.</p>';
+    return;
+  }
+  const seq = ++sourceSearchSeq;
+  results.innerHTML = '<p class="sources-empty">Searching…</p>';
+  try {
+    const data = await send(`/projects/${state.editingProject}/search`, { query, resourceIds });
+    if (seq === sourceSearchSeq) results.innerHTML = sourceResults(data);
+  } catch (error) {
+    if (seq === sourceSearchSeq) results.innerHTML = `<p class="sources-empty sources-error">${e(error.message)}</p>`;
+  }
+}
+
 function initMemoEditor(d) {
   renderMemoOutline();
   renderMemoBase();
@@ -3218,6 +3349,7 @@ async function renderWorkstream(project, id) {
           </button>
         </div>
       </form>
+      ${isMemo && state.workspace?.aiEnabled ? sourcesDrawer() : ''}
     `;
 
   shell(`
@@ -3290,6 +3422,7 @@ function confirmAction(title, subtitle, form, data) {
 
 async function route() {
   closeWorkstreamMenu();
+  document.body.classList.remove('sources-open');
   // Leaving a toolkit flushes its pending autosave before the page is replaced.
   await saveWorkstream({ quiet: true });
   // If not signed in: always show the Sign-in / Sign-up page first!
@@ -3401,6 +3534,20 @@ document.addEventListener('click', async event => {
       location.hash = '#project-setup';
     } else if (action === 'toggle-workstream-menu') {
       toggleWorkstreamMenu(target);
+    } else if (action === 'sources-toggle') {
+      if (document.querySelector('#sources-drawer')?.hidden === false) closeSources(); else openSources();
+    } else if (action === 'sources-close') {
+      closeSources();
+    } else if (action === 'sources-search') {
+      await runSourceSearch();
+    } else if (action === 'section-sources') {
+      // A section's search starts from its heading and the memo's question; the query stays editable.
+      const heading = target.closest('.memo-section')?.querySelector('.memo-section-heading')?.value.trim() || '';
+      openSources([heading, state.editing?.params?.problem || ''].filter(Boolean).join(': ').slice(0, 600));
+    } else if (action === 'source-expand') {
+      const card = target.closest('.source-card');
+      const expanded = card.classList.toggle('expanded');
+      target.textContent = expanded ? 'Show less' : 'Show full passage';
     } else if (action === 'toggle-document-menu') {
       toggleDocumentMenu(target);
     } else if (action === 'toggle-team-menu') {
@@ -3799,6 +3946,14 @@ document.addEventListener('keydown', event => {
   if (event.key === 'Enter' && event.target.id === 'memo-custom-standard') {
     event.preventDefault();
     addMemoStandard();
+  }
+  if (event.key === 'Enter' && event.target.id === 'sources-query') {
+    event.preventDefault();
+    runSourceSearch();
+  }
+  if (event.key === 'Escape' && event.target.closest?.('#sources-drawer')) {
+    closeSources();
+    document.querySelector('[data-action="sources-toggle"]')?.focus();
   }
 });
 

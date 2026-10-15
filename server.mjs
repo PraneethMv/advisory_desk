@@ -7,9 +7,10 @@ import { promisify } from 'node:util';
 import { DatabaseSync } from 'node:sqlite';
 import { buildDraft, STANDARD_CATALOG } from './lib/drafts.mjs';
 import { exportDocument } from './lib/exports.mjs';
-import { createOllamaProvider, aiConfigFromEnv } from './lib/ai/provider.mjs';
-import { extractDocument } from './lib/ai/extract.mjs';
-import { chunkPages, CHUNKER_VERSION, passageForEmbedding, vectorToBlob } from './lib/ai/chunk.mjs';
+import { createOllamaProvider, aiConfigFromEnv, AIUnavailableError } from './lib/ai/provider.mjs';
+import { extractDocument, EXTRACTOR_VERSION } from './lib/ai/extract.mjs';
+import { chunkPages, CHUNKER_VERSION, passageForEmbedding, queryForEmbedding, vectorToBlob } from './lib/ai/chunk.mjs';
+import { searchPassages } from './lib/ai/search.mjs';
 import { MEMO_GUIDE, DEFAULT_MEMO_HEADINGS, SECTION_STATUSES, COMPLETION_CHECKLIST, allSectionsReady, composeMemo, memoFromBody, normaliseMemo } from './lib/memo.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -245,6 +246,11 @@ export async function createApp(options = {}) {
     db.exec('BEGIN IMMEDIATE');
     try { const result = fn(); db.exec('COMMIT'); return result; } catch (error) { db.exec('ROLLBACK'); throw error; }
   };
+  // A new extractor reads every document again; each one's passages are rebuilt once it is read.
+  if (db.prepare("SELECT value FROM settings WHERE key='extractor'").get()?.value !== String(EXTRACTOR_VERSION)) {
+    db.prepare("UPDATE resources SET extract_status='pending' WHERE extract_status<>'unsupported'").run();
+    db.prepare("INSERT INTO settings (key,value) VALUES ('extractor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(String(EXTRACTOR_VERSION));
+  }
   // Documents are read one at a time in a background worker. Anything marked 'pending' (new
   // uploads, edited drafts, documents saved before extraction existed) is picked up in upload order.
   let extracting = null; let stopping = false;
@@ -329,6 +335,7 @@ export async function createApp(options = {}) {
     if (!getSettings().aiEnabled) return { search_status: 'ai_off', search_note: 'Text is ready. Turn on AI assistance in Settings to finish indexing it for search.' };
     return { search_status: 'indexing', search_note: indexError ? `Waiting for the local AI runtime: ${indexError}` : `Indexing ${r.unindexed} of ${r.passage_count} passages…` };
   };
+  const resourcesWithStatus = projectId => db.prepare('SELECT r.id,r.name,r.kind,r.size,r.created,r.created_by,r.workstream_id,r.is_final,r.extract_status,r.extract_note,(SELECT COUNT(*) FROM passages p WHERE p.resource_id=r.id) AS passage_count,(SELECT COUNT(*) FROM passages p WHERE p.resource_id=r.id AND (p.embed_model IS NULL OR p.embed_model<>?)) AS unindexed FROM resources r WHERE r.project_id=? ORDER BY r.created DESC').all(embedModel, projectId).map(r => ({ ...r, ...searchStatus(r) }));
   kickExtraction();
   kickIndexing();
   // One-time password reset codes. The super user (or the reset-password server command) hands
@@ -651,7 +658,7 @@ export async function createApp(options = {}) {
         if (!suffix && method === 'GET') {
           respond(res, 200, {
             project,
-            resources: db.prepare('SELECT r.id,r.name,r.kind,r.size,r.created,r.created_by,r.workstream_id,r.is_final,r.extract_status,r.extract_note,(SELECT COUNT(*) FROM passages p WHERE p.resource_id=r.id) AS passage_count,(SELECT COUNT(*) FROM passages p WHERE p.resource_id=r.id AND (p.embed_model IS NULL OR p.embed_model<>?)) AS unindexed FROM resources r WHERE r.project_id=? ORDER BY r.created DESC').all(embedModel, project.id).map(r => ({ ...r, ...searchStatus(r) })),
+            resources: resourcesWithStatus(project.id),
             deliverables: db.prepare('SELECT id,kind,title,status,created,updated,created_by,is_final FROM deliverables WHERE project_id=? ORDER BY updated DESC').all(project.id),
             members: db.prepare("SELECT u.id,u.name,u.email,u.designation,m.role FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.project_id=? ORDER BY CASE WHEN m.role='Engagement Manager' THEN 1 WHEN m.role='Reviewer' THEN 2 ELSE 3 END, u.name ASC").all(project.id),
             activity: db.prepare('SELECT a.*,u.name AS user_name FROM activity a JOIN users u ON u.id=a.user_id WHERE project_id=? ORDER BY created DESC LIMIT 40').all(project.id)
@@ -776,6 +783,27 @@ export async function createApp(options = {}) {
           ownerOnly(project, user); requireValue(memberMatch[1] !== project.owner_id, 'The project owner cannot be removed.');
           const member = db.prepare('SELECT u.* FROM memberships m JOIN users u ON u.id=m.user_id WHERE project_id=? AND user_id=?').get(project.id, memberMatch[1]); requireValue(member, 'Member not found.', 404);
           transaction(() => { db.prepare('DELETE FROM memberships WHERE project_id=? AND user_id=?').run(project.id, member.id); activity(project.id, user.id, `Removed ${member.name} from the project`); }); respond(res, 200, { ok: true }); return;
+        }
+        // Sources search for the Memo Builder: only the documents chosen in Memo Base, all checked to be in this project.
+        if (suffix === 'search' && method === 'POST') {
+          requireValue(getSettings().aiEnabled, 'Turn on AI assistance in Settings to search engagement documents.', 409);
+          const input = await payload(req);
+          const query = textField(input.query, 'Search', 1000);
+          requireValue(Array.isArray(input.resourceIds) && input.resourceIds.length <= 50 && input.resourceIds.every(x => typeof x === 'string'), 'Choose valid engagement documents.');
+          const resourceIds = [...new Set(input.resourceIds)];
+          requireValue(resourceIds.length, 'Choose engagement documents in Memo Base to search them.');
+          const statuses = new Map(resourcesWithStatus(project.id).map(r => [r.id, r]));
+          requireValue(resourceIds.every(id => statuses.has(id)), 'A selected document is outside this project or unavailable.', 403);
+          let vector = null; let note = '';
+          try {
+            [vector] = await ai.embed([queryForEmbedding(query)], { timeoutMs: 30000 });
+          } catch (error) {
+            if (!(error instanceof AIUnavailableError)) throw error;
+            note = 'The local AI runtime is not reachable, so only keyword matches are shown.';
+          }
+          const results = searchPassages(db, { query, projectId: project.id, resourceIds, vector, embedModel, limit: 8 });
+          const documents = resourceIds.map(id => statuses.get(id)).map(r => ({ id: r.id, name: r.name, status: r.search_status, note: r.search_note }));
+          respond(res, 200, { query, mode: vector ? 'hybrid' : 'keyword', note, results, documents }); return;
         }
         if (suffix === 'resources' && method === 'POST') {
           const input = await payload(req); const name = textField(input.name, 'Filename', 180);

@@ -1337,6 +1337,91 @@ test('documents are split into passages, keyword-indexed, and embedded while AI 
   }
 });
 
+test('source search merges keyword and meaning matches inside the Memo Base documents only', async () => {
+  const { keywordQuery } = await import('../lib/ai/search.mjs');
+  const { AIUnavailableError: Unavailable } = await import('../lib/ai/provider.mjs');
+  assert.equal(keywordQuery('What is the "conversion" price? NEAR(x) OR *'), '"conversion" OR "price" OR "near"');
+  assert.equal(keywordQuery('the of and'), '');
+
+  const dir = await mkdtemp(resolve('test-results', 'search-'));
+  // Stand-in embeddings: each text points along the topics it mentions.
+  const topics = ['convert', 'interest', 'redeem', 'control'];
+  const searchAI = {
+    ...fakeAI, embedModel: 'embeddinggemma', down: false,
+    async embed(inputs) {
+      if (this.down) throw new Unavailable('The local AI runtime is not reachable.');
+      return inputs.map(text => topics.map(t => (text.toLowerCase().includes(t) || (t === 'convert' && /shares/i.test(text)) ? 1 : 0) + 0.01));
+    }
+  };
+  const searchApp = await createApp({ dataDir: dir, aiProvider: searchAI });
+  try {
+    await new Promise(done => searchApp.server.listen(0, '127.0.0.1', done));
+    const base = `http://127.0.0.1:${searchApp.server.address().port}/api`;
+    const session = () => {
+      const s = { cookie: '', csrf: '' };
+      s.request = async (path, method = 'GET', value) => {
+        const response = await fetch(`${base}${path}`, { method, headers: { 'Content-Type': 'application/json', ...(s.cookie ? { Cookie: s.cookie } : {}), ...(s.csrf ? { 'X-CSRF-Token': s.csrf } : {}) }, body: value === undefined ? undefined : JSON.stringify(value) });
+        const cookie = response.headers.get('set-cookie'); if (cookie) s.cookie = cookie.split(';')[0];
+        const body = await response.json(); if (body.csrf) s.csrf = body.csrf;
+        return { status: response.status, body };
+      };
+      return s;
+    };
+    const owner = session();
+    await owner.request('/auth/signup', 'POST', { name: 'Owner', email: 'owner@example.test', password: 'owner password long enough' });
+    await owner.request('/me/preferences', 'PATCH', { name: 'Owner', employeeId: 'AD-1', designation: 'Manager', acceptUsagePolicy: true });
+    const projectId = (await owner.request('/projects', 'POST', projectInput('Search'))).body.project.id;
+    const otherProjectId = (await owner.request('/projects', 'POST', projectInput('Other client'))).body.project.id;
+    const upload = async (project, name, text) => (await owner.request(`/projects/${project}/resources`, 'POST', { name, kind: 'reference', content: Buffer.from(text).toString('base64') })).body.id;
+    const terms = await upload(projectId, 'Terms.md', '# Term sheet\n\n## Conversion\n\nThe holder may turn each debenture into equity shares at INR 250.\n\n## Interest\n\nInterest of 17% accrues, 8% of it paid in kind.\n\n## Change of control\n\nOn a change of control the holder may require redemption at par.');
+    const unselected = await upload(projectId, 'Board minutes.md', 'The board discussed conversion of the debentures into shares.');
+    const foreign = await upload(otherProjectId, 'Other.md', 'Conversion of the lease into shares.');
+    const search = (body, who = owner) => who.request(`/projects/${projectId}/search`, 'POST', body);
+
+    assert.equal((await search({ query: 'conversion', resourceIds: [terms] })).status, 409, 'Search needs AI assistance on');
+    await owner.request('/settings/ai', 'PATCH', { enabled: true });
+    await searchApp.extractionIdle();
+
+    const hybrid = (await search({ query: 'Can the bondholder get shares instead of cash?', resourceIds: [terms] })).body;
+    assert.equal(hybrid.mode, 'hybrid');
+    assert.equal(hybrid.results[0].heading, 'Term sheet › Conversion', 'Meaning search finds the clause without shared words');
+    assert.ok(hybrid.results[0].matchedBy.includes('meaning'));
+    assert.ok(hybrid.results.every(r => r.resourceId === terms), 'Only the selected document is searched');
+    assert.deepEqual(hybrid.documents.map(d => [d.name, d.status]), [['Terms.md', 'searchable']]);
+
+    const keyword = (await search({ query: 'redemption at par', resourceIds: [terms] })).body;
+    assert.equal(keyword.results[0].heading, 'Term sheet › Change of control');
+    assert.ok(keyword.results[0].matchedBy.includes('keyword'));
+
+    // Search syntax in the query is treated as plain words.
+    assert.equal((await search({ query: '"conversion" NEAR( * OR AND -', resourceIds: [terms] })).status, 200);
+
+    // When the runtime is down, keyword matches are still returned, with a note.
+    searchAI.down = true;
+    const fallback = (await search({ query: 'interest paid in kind', resourceIds: [terms] })).body;
+    assert.equal(fallback.mode, 'keyword'); assert.match(fallback.note, /only keyword matches/);
+    assert.equal(fallback.results[0].heading, 'Term sheet › Interest');
+    searchAI.down = false;
+
+    // Scope and access are checked on the server.
+    assert.equal((await search({ query: 'conversion', resourceIds: [] })).status, 400);
+    assert.equal((await search({ query: 'conversion', resourceIds: [foreign] })).status, 403, 'Another project\'s document cannot be searched');
+    assert.equal((await search({ query: 'conversion', resourceIds: [terms, foreign] })).status, 403);
+    const outsider = session(); await outsider.request('/auth/demo', 'POST', {});
+    assert.equal((await search({ query: 'conversion', resourceIds: [terms] }, outsider)).status, 404);
+    assert.ok((await search({ query: 'conversion shares', resourceIds: [terms, unselected] })).body.results.some(r => r.resourceId === unselected));
+  } finally {
+    await searchApp.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('extracted text repairs PDF ligatures so keyword search can match', async () => {
+  const { extractInProcess } = await import('../lib/ai/extract.mjs');
+  const result = await extractInProcess('notes.txt', Buffer.from('Performance obligaƟons. AcquisiƟon, construcƟon and the ﬁnal ﬂoor.'));
+  assert.equal(result.pages[0].text, 'Performance obligations. Acquisition, construction and the final floor.');
+});
+
 test('Word documents keep headings, tables and paragraph order, and skip deleted text', async () => {
   const { docxText } = await import('../lib/ai/extract.mjs');
   const { deflateRawSync } = await import('node:zlib');
