@@ -3827,11 +3827,72 @@ textarea {
   background: var(--brand-blue-tint);
 }
 
-.upload-zone .icon {
+.upload-zone > .icon {
+  display: block;
   width: 32px;
   height: 32px;
   color: var(--brand-blue);
-  margin-bottom: 8px;
+  margin: 0 auto 8px;
+}
+
+.upload-zone.has-file {
+  border-style: solid;
+  border-color: var(--success);
+  background: color-mix(in srgb, var(--success) 6%, var(--bg-surface));
+}
+
+.upload-zone.has-file > .icon {
+  color: var(--success);
+}
+
+.upload-zone.file-error {
+  border-style: solid;
+  border-color: var(--destructive);
+}
+
+.upload-zone .upload-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  margin-top: 14px;
+  padding: 8px 14px;
+  border: 1px solid var(--outline);
+  border-radius: var(--radius-pill);
+  background: var(--bg-surface);
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.upload-zone .upload-file[hidden] {
+  display: none;
+}
+
+.upload-zone .upload-file .icon {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  color: var(--success);
+}
+
+.upload-zone.file-error .upload-file .icon {
+  color: var(--destructive);
+}
+
+.upload-zone .upload-file span {
+  overflow: hidden;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.upload-zone .upload-file small {
+  flex-shrink: 0;
+  font-size: 11.5px;
+  color: var(--text-muted);
 }
 
 .upload-zone strong {
@@ -4971,6 +5032,73 @@ textarea {
   min-width: 0;
   font-family: var(--font-mono);
   font-size: 13px;
+}
+
+.read-status {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  vertical-align: 1px;
+}
+
+.read-status.read-pending {
+  background: var(--brand-blue-container);
+  color: var(--brand-blue);
+}
+
+.read-status.read-ready {
+  background: color-mix(in srgb, var(--success) 14%, transparent);
+  color: var(--success);
+}
+
+.read-status.read-review {
+  background: color-mix(in srgb, var(--destructive) 12%, transparent);
+  color: var(--destructive);
+}
+
+.read-status.read-muted {
+  background: var(--bg-surface-variant);
+  color: var(--text-muted);
+}
+
+.extracted-text {
+  max-height: 60vh;
+  overflow-y: auto;
+  margin: 12px 0;
+  padding: 16px;
+  border: 1px solid var(--outline-variant);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface-variant);
+}
+
+.extracted-text section + section {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--outline-variant);
+}
+
+.extracted-text h3 {
+  margin-bottom: 6px;
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.extracted-text p {
+  white-space: pre-wrap;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-primary);
+}
+
+.extracted-empty {
+  margin: 16px 0;
+  color: var(--text-muted);
 }
 
 .role-pill.role-inactive {

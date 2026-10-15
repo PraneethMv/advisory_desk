@@ -8,6 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { buildDraft, STANDARD_CATALOG } from './lib/drafts.mjs';
 import { exportDocument } from './lib/exports.mjs';
 import { createOllamaProvider, aiConfigFromEnv } from './lib/ai/provider.mjs';
+import { extractDocument } from './lib/ai/extract.mjs';
 import { MEMO_GUIDE, DEFAULT_MEMO_HEADINGS, SECTION_STATUSES, COMPLETION_CHECKLIST, allSectionsReady, composeMemo, memoFromBody, normaliseMemo } from './lib/memo.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -198,6 +199,15 @@ export async function createApp(options = {}) {
     db.exec('ALTER TABLE resources ADD COLUMN workstream_id TEXT DEFAULT NULL');
   }
   db.exec('CREATE INDEX IF NOT EXISTS resources_workstream ON resources(workstream_id)');
+  // Extracted document text, page by page. Existing documents start as 'pending' and are read on startup.
+  if (!resourceColumns.has('extract_status')) {
+    db.exec("ALTER TABLE resources ADD COLUMN extract_status TEXT NOT NULL DEFAULT 'pending'");
+    db.exec("ALTER TABLE resources ADD COLUMN extract_note TEXT NOT NULL DEFAULT ''");
+  }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS document_pages (resource_id TEXT NOT NULL REFERENCES resources(id) ON DELETE CASCADE, seq INTEGER NOT NULL, page INTEGER, text TEXT NOT NULL, PRIMARY KEY (resource_id, seq));
+    CREATE INDEX IF NOT EXISTS resources_extract ON resources(extract_status);
+  `);
   // Final Deliverables are documents moved out of Engagement Documents. Workstreams
   // finalised under the earlier model are carried over as exported documents below.
   const migrateFinalWorkstreams = !resourceColumns.has('is_final');
@@ -218,6 +228,32 @@ export async function createApp(options = {}) {
     db.exec('BEGIN IMMEDIATE');
     try { const result = fn(); db.exec('COMMIT'); return result; } catch (error) { db.exec('ROLLBACK'); throw error; }
   };
+  // Documents are read one at a time in a background worker. Anything marked 'pending' (new
+  // uploads, edited drafts, documents saved before extraction existed) is picked up in upload order.
+  let extracting = null; let stopping = false;
+  const kickExtraction = () => {
+    extracting ??= (async () => {
+      try {
+        for (let row; !stopping && (row = db.prepare("SELECT id,name,content FROM resources WHERE extract_status='pending' ORDER BY created LIMIT 1").get());) {
+          const result = await extractDocument(row.name, Buffer.from(row.content));
+          if (stopping) break;
+          transaction(() => {
+            const current = db.prepare('SELECT content FROM resources WHERE id=?').get(row.id);
+            // A draft edited while it was being read stays pending and is read again.
+            if (!current || Buffer.compare(Buffer.from(current.content), Buffer.from(row.content)) !== 0) return;
+            db.prepare('DELETE FROM document_pages WHERE resource_id=?').run(row.id);
+            const insert = db.prepare('INSERT INTO document_pages (resource_id, seq, page, text) VALUES (?,?,?,?)');
+            result.pages.forEach((page, seq) => insert.run(row.id, seq, page.page, page.text));
+            db.prepare('UPDATE resources SET extract_status=?, extract_note=? WHERE id=?').run(result.status, result.note, row.id);
+          });
+        }
+      } catch (error) {
+        if (!stopping) console.error('Document extraction stopped:', error.message);
+      }
+    })().finally(() => { extracting = null; });
+    return extracting;
+  };
+  kickExtraction();
   // One-time password reset codes. The super user (or the reset-password server command) hands
   // the code over directly; the app sends no email. A new code cancels any earlier one.
   const issueResetCode = (userId, issuedBy = null) => {
@@ -358,6 +394,8 @@ export async function createApp(options = {}) {
     try {
       const path = new URL(req.url, 'http://localhost').pathname;
       const method = req.method;
+      // Any change may have added or edited a document; reading it starts once the response is sent.
+      if (method !== 'GET' && method !== 'HEAD') res.once('finish', kickExtraction);
       const boundAddress = server.address();
       const boundPort = boundAddress && typeof boundAddress === 'object' ? boundAddress.port : 3000;
       const hostName = options.host || process.env.HOST || '127.0.0.1';
@@ -536,7 +574,7 @@ export async function createApp(options = {}) {
         if (!suffix && method === 'GET') {
           respond(res, 200, {
             project,
-            resources: db.prepare('SELECT id,name,kind,size,created,created_by,workstream_id,is_final FROM resources WHERE project_id=? ORDER BY created DESC').all(project.id),
+            resources: db.prepare('SELECT id,name,kind,size,created,created_by,workstream_id,is_final,extract_status,extract_note FROM resources WHERE project_id=? ORDER BY created DESC').all(project.id),
             deliverables: db.prepare('SELECT id,kind,title,status,created,updated,created_by,is_final FROM deliverables WHERE project_id=? ORDER BY updated DESC').all(project.id),
             members: db.prepare("SELECT u.id,u.name,u.email,u.designation,m.role FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.project_id=? ORDER BY CASE WHEN m.role='Engagement Manager' THEN 1 WHEN m.role='Reviewer' THEN 2 ELSE 3 END, u.name ASC").all(project.id),
             activity: db.prepare('SELECT a.*,u.name AS user_name FROM activity a JOIN users u ON u.id=a.user_id WHERE project_id=? ORDER BY created DESC LIMIT 40').all(project.id)
@@ -689,6 +727,11 @@ export async function createApp(options = {}) {
           respond(res, 200, { ok: true, moved: documents.length });
           return;
         }
+        const textMatch = /^resources\/([\w-]+)\/text$/.exec(suffix);
+        if (textMatch && method === 'GET') {
+          const resource = db.prepare('SELECT id,name,extract_status,extract_note FROM resources WHERE id=? AND project_id=?').get(textMatch[1], project.id); requireValue(resource, 'Resource not found.', 404);
+          respond(res, 200, { name: resource.name, status: resource.extract_status, note: resource.extract_note, pages: db.prepare('SELECT page,text FROM document_pages WHERE resource_id=? ORDER BY seq').all(resource.id) }); return;
+        }
         const resourceMatch = /^resources\/([\w-]+)$/.exec(suffix);
         if (resourceMatch && ['GET', 'DELETE'].includes(method)) {
           const resource = db.prepare('SELECT * FROM resources WHERE id=? AND project_id=?').get(resourceMatch[1], project.id); requireValue(resource, 'Resource not found.', 404);
@@ -830,7 +873,7 @@ export async function createApp(options = {}) {
               const draftDoc = db.prepare("SELECT id FROM resources WHERE workstream_id=? AND project_id=? AND kind='draft' AND is_final=0").get(delivery.id, project.id);
               const draftBytes = Buffer.from(body, 'utf8');
               if (draftDoc) {
-                db.prepare('UPDATE resources SET name=?, size=?, content=?, text=? WHERE id=?').run(
+                db.prepare("UPDATE resources SET name=?, size=?, content=?, text=?, extract_status='pending' WHERE id=?").run(
                   `${title}.md`, draftBytes.length, draftBytes, body, draftDoc.id
                 );
               } else {
@@ -854,7 +897,11 @@ export async function createApp(options = {}) {
   });
   server.requestTimeout = 120000;
   server.headersTimeout = 20000;
-  return { server, db, issueResetCode, close: async () => { await new Promise(resolveClose => server.close(resolveClose)); db.close(); } };
+  return {
+    server, db, issueResetCode,
+    extractionIdle: async () => { while (extracting) await extracting; },
+    close: async () => { stopping = true; await new Promise(resolveClose => server.close(resolveClose)); await extracting; db.close(); }
+  };
 }
 
 // Recovery when nobody can sign in to issue a code, e.g. the only super user forgot their password.

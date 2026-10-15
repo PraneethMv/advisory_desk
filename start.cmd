@@ -14,6 +14,17 @@ if not exist "%ProgramFiles%\nodejs\node.exe" (
     exit /b 1
   )
 )
+rem The PDF reader is the only package. Install it once if it is missing.
+if not exist "node_modules\pdfjs-dist" (
+  echo Installing the PDF reader package...
+  set "ADVISORY_NPM=npm.cmd"
+  where npm.cmd >nul 2>nul || set "ADVISORY_NPM=%ProgramFiles%\nodejs\npm.cmd"
+  call "%ADVISORY_NPM%" install
+  if errorlevel 1 (
+    echo Package installation failed. Run "npm install" in this folder and try again.
+    exit /b 1
+  )
+)
 if exist ".env" (
   "%ADVISORY_NODE%" --env-file=.env server.mjs
 ) else (

@@ -1151,6 +1151,88 @@ test('super users issue one-time password reset codes; users change their own pa
   }
 });
 
+test('engagement documents are read in the background with page numbers and a status', async () => {
+  const dir = await mkdtemp(resolve('test-results', 'extract-'));
+  let docsApp = await createApp({ dataDir: dir, aiProvider: fakeAI });
+  try {
+    await new Promise(done => docsApp.server.listen(0, '127.0.0.1', done));
+    const base = () => `http://127.0.0.1:${docsApp.server.address().port}/api`;
+    const session = () => {
+      const s = { cookie: '', csrf: '' };
+      s.request = async (path, method = 'GET', value) => {
+        const response = await fetch(`${base()}${path}`, { method, headers: { 'Content-Type': 'application/json', ...(s.cookie ? { Cookie: s.cookie } : {}), ...(s.csrf ? { 'X-CSRF-Token': s.csrf } : {}) }, body: value === undefined ? undefined : JSON.stringify(value) });
+        const cookie = response.headers.get('set-cookie'); if (cookie) s.cookie = cookie.split(';')[0];
+        const body = await response.json(); if (body.csrf) s.csrf = body.csrf;
+        return { status: response.status, body };
+      };
+      return s;
+    };
+    const owner = session();
+    await owner.request('/auth/signup', 'POST', { name: 'Owner', email: 'owner@example.test', password: 'owner password long enough' });
+    await owner.request('/me/preferences', 'PATCH', { name: 'Owner', employeeId: 'AD-1', designation: 'Manager', acceptUsagePolicy: true });
+    const projectId = (await owner.request('/projects', 'POST', projectInput('Document reading'))).body.project.id;
+
+    const termSheet = '# OCD term sheet\n\n' + Array.from({ length: 80 }, (_, i) => `Clause ${i + 1}. The holder may convert each debenture into equity shares at INR ${100 + i}.`).join('\n\n');
+    const delivery = { kind: 'memo', title: 'Term sheet', body: termSheet, params: '{}' };
+    const upload = (name, bytes) => owner.request(`/projects/${projectId}/resources`, 'POST', { name, kind: 'reference', content: Buffer.from(bytes).toString('base64') });
+    const ids = {
+      pdf: (await upload('Term sheet.pdf', exportDocument(delivery, 'pdf', {}).bytes)).body.id,
+      docx: (await upload('Term sheet.docx', exportDocument(delivery, 'docx', {}).bytes)).body.id,
+      md: (await upload('Notes.md', '# Notes\n\nManagement expects conversion in 2028.')).body.id,
+      sheet: (await upload('Schedule.xlsx', 'not really a spreadsheet')).body.id,
+      broken: (await upload('Broken.pdf', 'this is not a PDF')).body.id
+    };
+    await docsApp.extractionIdle();
+
+    const statuses = Object.fromEntries((await owner.request(`/projects/${projectId}`)).body.resources.map(r => [r.id, r.extract_status]));
+    assert.deepEqual([statuses[ids.pdf], statuses[ids.docx], statuses[ids.md], statuses[ids.sheet], statuses[ids.broken]], ['ready', 'ready', 'ready', 'unsupported', 'failed']);
+
+    const pdf = (await owner.request(`/projects/${projectId}/resources/${ids.pdf}/text`)).body;
+    assert.ok(pdf.pages.length > 1, 'A multi-page PDF keeps its pages');
+    assert.deepEqual(pdf.pages.map(p => p.page), pdf.pages.map((_, i) => i + 1));
+    assert.match(pdf.pages[0].text, /Clause 1\. The holder may convert each debenture into equity shares at INR 100\./);
+    assert.match(pdf.pages.at(-1).text, /Clause 80\. .*INR 179\./);
+    const docx = (await owner.request(`/projects/${projectId}/resources/${ids.docx}/text`)).body;
+    assert.equal(docx.pages.length, 1); assert.equal(docx.pages[0].page, null);
+    assert.match(docx.pages[0].text, /^# OCD term sheet\n\nClause 1\./);
+    assert.match((await owner.request(`/projects/${projectId}/resources/${ids.broken}/text`)).body.note, /could not be read/);
+
+    // Other projects' documents stay invisible.
+    const outsider = session();
+    await outsider.request('/auth/demo', 'POST', {});
+    assert.equal((await outsider.request(`/projects/${projectId}/resources/${ids.pdf}/text`)).status, 404);
+
+    // Documents saved before extraction existed are read when the server next starts.
+    docsApp.db.prepare("UPDATE resources SET extract_status='pending' WHERE id=?").run(ids.md);
+    docsApp.db.prepare('DELETE FROM document_pages WHERE resource_id=?').run(ids.md);
+    await docsApp.close();
+    docsApp = await createApp({ dataDir: dir, aiProvider: fakeAI });
+    await docsApp.extractionIdle();
+    assert.equal(docsApp.db.prepare('SELECT extract_status FROM resources WHERE id=?').get(ids.md).extract_status, 'ready');
+    assert.match(docsApp.db.prepare('SELECT text FROM document_pages WHERE resource_id=?').get(ids.md).text, /conversion in 2028/);
+
+    // Deleting a document removes its extracted text.
+    docsApp.db.prepare('DELETE FROM resources WHERE id=?').run(ids.pdf);
+    assert.equal(docsApp.db.prepare('SELECT COUNT(*) AS n FROM document_pages WHERE resource_id=?').get(ids.pdf).n, 0);
+  } finally {
+    await docsApp.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Word documents keep headings, tables and paragraph order, and skip deleted text', async () => {
+  const { docxText } = await import('../lib/ai/extract.mjs');
+  const { deflateRawSync } = await import('node:zlib');
+  const xml = '<w:document xmlns:w="w"><w:body><w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>Key terms</w:t></w:r></w:p><w:p><w:r><w:t xml:space="preserve">Coupon of 17% </w:t></w:r><w:del><w:r><w:delText>withdrawn</w:delText></w:r></w:del><w:r><w:t>cash &amp; PIK</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:t>Tenor</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>5 years</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t>After the table</w:t></w:r></w:p></w:body></w:document>';
+  // A compressed archive, as Word itself saves files.
+  const data = deflateRawSync(Buffer.from(xml)); const name = Buffer.from('word/document.xml');
+  const local = Buffer.alloc(30); local.writeUInt32LE(0x04034b50); local.writeUInt16LE(8, 8); local.writeUInt32LE(data.length, 18); local.writeUInt32LE(xml.length, 22); local.writeUInt16LE(name.length, 26);
+  const entry = Buffer.alloc(46); entry.writeUInt32LE(0x02014b50); entry.writeUInt16LE(8, 10); entry.writeUInt32LE(data.length, 20); entry.writeUInt32LE(xml.length, 24); entry.writeUInt16LE(name.length, 28);
+  const directory = Buffer.concat([entry, name]); const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50); end.writeUInt16LE(1, 8); end.writeUInt16LE(1, 10); end.writeUInt32LE(directory.length, 12); end.writeUInt32LE(local.length + name.length + data.length, 16);
+  assert.equal(docxText(Buffer.concat([local, name, data, directory, end])), '## Key terms\n\nCoupon of 17% cash & PIK\n\nTenor | 5 years\n\nAfter the table');
+});
+
 test('the reset-password server command issues a code for a locked-out account', async () => {
   const { execFile } = await import('node:child_process');
   const dir = await mkdtemp(resolve('test-results', 'cli-'));

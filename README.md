@@ -59,6 +59,7 @@ Advisory Desk follows a structured, role-aware workflow:
 All core advisory tools and deliverables sit exclusively inside each engagement:
 - **Workstream Setup**: Select **New**, choose Memo Builder or Slide Decks, and enter the setup fields. **Setup Workflow** saves the workstream and returns to the engagement dashboard without generating an outline or adding a draft document.
 - **Standalone Toolkits**: Open a saved workstream to enter its dedicated toolkit page. Create the memo or deck outline there, then edit, review, and export it. Creating the outline adds the workstream's Markdown draft to Engagement Documents. Edits autosave a moment after you stop typing, and every save updates that draft. **Add to Engagement Documents** creates the Word (`.docx`) memo or PowerPoint (`.pptx`) deck from the latest edits whenever you choose.
+- **Document Reading**: Text from PDF (page by page), Word, text, Markdown, CSV and JSON documents is read in the background for search and AI drafting. Each document in Engagement Documents shows **Reading…**, **Text ready**, **Needs review** (e.g. a scanned or password-protected PDF), **Could not read**, or **Not searchable yet** (Excel, PowerPoint and images), and the eye button shows the text that was read. Parsing runs in a separate worker thread with time and memory limits, and nothing inside a document is executed.
 - **Document Flow**: Every document (uploads, workstream drafts, and added Word or PowerPoint files) starts in **Engagement Documents**. Select documents there and choose **Move to Final Deliverables**. Final Deliverables can return a document to Engagement Documents. A Markdown draft moved to Final Deliverables is kept as it was, and the workstream starts a new live draft on its next save.
 - **Workstream Actions**: Each dashboard row has a three-dot menu for opening its toolkit, adding its document to Engagement Documents, or deleting it. Only the creator or engagement owner can delete a workstream. Deletion requires confirmation and removes its live draft while keeping added documents, reference documents, and anything in Final Deliverables.
 - **Technical Accounting Memos (Memo Builder)**: The toolkit runs in three stages, saved together:
@@ -118,7 +119,7 @@ Exports always reflect the latest saved draft version in the database.
 
 ### Prerequisites
 - **Node.js 24 or later** (uses built-in SQLite, Crypto, and HTTP).
-- Zero external runtime npm packages required.
+- One npm package: [`pdfjs-dist`](https://www.npmjs.com/package/pdfjs-dist) (Mozilla's PDF reader, pinned) for reading PDF engagement documents. `start.cmd` installs it on first run; otherwise run `npm install` once. `.npmrc` skips its optional native drawing add-on, which is not needed.
 
 ### Starting the Server
 
@@ -220,4 +221,4 @@ On a 16 GB machine without a GPU, `gemma4:e4b` writes about 15–18 tokens per s
 - **Engagement Creation Flow**: Dedicated multi-step wizard for configuring new client advisory workstreams.
 - **Knowledge Base (Phase 2)**: Authoritative standards library with offline paragraph indexing across IFRS, Ind AS, and US GAAP (ASC topics).
 - **FS Sanity Checks (Phase 2)**: Automated casting, cross-statement referencing, and balance verification.
-- **Local AI Agents**: Phase 0 is in place: a local model provider (Ollama, `gemma4:e4b` for drafting and `embeddinggemma` for search), a runtime health check, and the workspace switch. Next: indexing Engagement Documents, retrieval with a source inspector, and grounded drafting in the Memo Builder. See `reference/Accounting_Advisory_Memo_AI_RAG_Implementation_Proposal.md`.
+- **Local AI Agents**: Phase 0 is in place: a local model provider (Ollama, `gemma4:e4b` for drafting and `embeddinggemma` for search), a runtime health check, and the workspace switch. Phase 1 is under way: reading Engagement Documents is in place. Next: indexing them into searchable passages, a Sources panel in the Memo Builder, and a **Draft with AI** action on each memo section with checked source citations. See `reference/Accounting_Advisory_Memo_AI_RAG_Implementation_Proposal.md` (v1.1).

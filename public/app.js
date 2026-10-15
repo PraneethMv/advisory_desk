@@ -1550,7 +1550,7 @@ function resourceRows(resources, compact = false) {
           <span class="resource-icon">${documentIcon(r)}</span>
           <div class="resource-name">
             <strong>${e(r.name)}</strong>
-            <small>${documentKind(r)} <span>·</span> ${size(r.size)} <span>·</span> ${date(r.created)}</small>
+            <small>${documentKind(r)} <span>·</span> ${size(r.size)} <span>·</span> ${date(r.created)} ${compact ? '' : readStatus(r)}</small>
           </div>
           <a class="icon-btn" href="/api/projects/${p.id}/resources/${r.id}" aria-label="Download ${e(r.name)}" title="Download">${icon('download')}</a>
           ${!compact && (r.created_by === state.user.id || p.owner_id === state.user.id) ? button(icon('trash'), 'delete-resource', 'icon-btn subtle-danger', `data-id="${r.id}" data-name="${e(r.name)}" aria-label="Remove ${e(r.name)}"`) : ''}
@@ -1929,7 +1929,7 @@ function renderProject() {
                   <span class="quiet-type-icon tone-blue">${documentIcon(r)}</span>
                   <div class="quiet-name-group">
                     <strong class="resource-title">${e(r.name)}</strong>
-                    <small class="resource-meta">${documentKind(r)}</small>
+                    <small class="resource-meta">${documentKind(r)} ${readStatus(r)}</small>
                   </div>
                 </div>
                 <div class="document-col-size">
@@ -1942,6 +1942,7 @@ function renderProject() {
                   <span class="font-mono text-muted">${formatDateTime(r.created)}</span>
                 </div>
                 <div class="document-col-action">
+                  ${button(icon('eye'), 'view-text', 'quiet-ghost-action', `data-id="${r.id}" aria-label="View text read from ${e(r.name)}" title="View extracted text"`)}
                   <a class="quiet-ghost-action" href="/api/projects/${p.id}/resources/${r.id}" aria-label="Download ${e(r.name)}" title="Download">${icon('download')}</a>
                   ${(r.created_by === state.user.id || p.owner_id === state.user.id) ? button(icon('trash'), 'delete-resource', 'quiet-ghost-action subtle-danger', `data-id="${r.id}" data-name="${e(r.name)}" aria-label="Remove ${e(r.name)}" title="Remove document"`) : ''}
                 </div>
@@ -2115,6 +2116,45 @@ function renderProject() {
 
     <div class="project-tab-content">${content}</div>
   `, 'Engagement Manager', p.name);
+  watchReadStatus();
+}
+
+// Whether a document's text has been read for search and AI drafting. Reading happens in the background.
+const READ_STATUS = {
+  pending: ['Reading…', 'pending'],
+  ready: ['Text ready', 'ready'],
+  needs_review: ['Needs review', 'review'],
+  failed: ['Could not read', 'review'],
+  unsupported: ['Not searchable yet', 'muted']
+};
+const readStatus = r => {
+  const [label, tone] = READ_STATUS[r.extract_status] || READ_STATUS.pending;
+  return `<span class="read-status read-${tone}" data-read-status="${r.id}" title="${e(r.extract_note || label)}">${label}</span>`;
+};
+
+// Refreshes the status labels in place until no document on the page is still being read.
+let readStatusTimer;
+function watchReadStatus() {
+  clearTimeout(readStatusTimer);
+  const projectId = state.project?.project.id;
+  if (!state.project?.resources.some(r => r.extract_status === 'pending')) return;
+  const stillHere = () => state.page === 'project' && state.project?.project.id === projectId;
+  readStatusTimer = setTimeout(async () => {
+    if (!stillHere()) return;
+    try {
+      const fresh = await api(`/projects/${projectId}`);
+      if (!stillHere()) return;
+      for (const r of fresh.resources) {
+        const current = state.project.resources.find(x => x.id === r.id);
+        if (!current || current.extract_status === r.extract_status) continue;
+        Object.assign(current, { extract_status: r.extract_status, extract_note: r.extract_note });
+        document.querySelectorAll(`[data-read-status="${r.id}"]`).forEach(node => { node.outerHTML = readStatus(current); });
+      }
+    } catch {
+      return;
+    }
+    watchReadStatus();
+  }, 3000);
 }
 
 /* ==========================================================================
@@ -2421,8 +2461,9 @@ function uploadResource() {
         <div class="form-stack">
           <label class="upload-zone">
             ${icon('upload')}
-            <strong>Choose evidence file for this project</strong>
-            <span>PDF, Word (.docx), PowerPoint, Excel, CSV, text, or Markdown · up to 10 MB</span>
+            <strong data-upload-title>Choose evidence file for this project</strong>
+            <span data-upload-hint>PDF, Word (.docx), PowerPoint, Excel, CSV, text, or Markdown · up to 10 MB</span>
+            <span class="upload-file" data-upload-file hidden></span>
             <input type="file" name="file" accept=".pdf,.docx,.pptx,.xlsx,.xls,.csv,.txt,.md,.json,.png,.jpg,.jpeg" required>
           </label>
           <label>Resource type
@@ -3612,6 +3653,28 @@ document.addEventListener('click', async event => {
         'remove-member-form',
         `data-id="${target.dataset.id}"`
       );
+    } else if (action === 'view-text') {
+      const result = await api(`/projects/${state.project.project.id}/resources/${target.dataset.id}/text`);
+      const [label] = READ_STATUS[result.status] || READ_STATUS.pending;
+      showModal(
+        result.name,
+        result.pages.length ? `Text read for search and AI drafting${result.pages[0].page ? ` · ${result.pages.length} pages` : ''}.` : label,
+        `
+          ${result.note ? `<div class="inline-note">${icon('info')}<span>${e(result.note)}</span></div>` : ''}
+          ${result.pages.length ? `
+            <div class="extracted-text">
+              ${result.pages.map(p => `
+                <section>
+                  ${p.page ? `<h3>Page ${p.page}</h3>` : ''}
+                  <p>${e(p.text)}</p>
+                </section>
+              `).join('')}
+            </div>
+          ` : `<p class="extracted-empty">${result.status === 'pending' ? 'This document is still being read. Check again in a moment.' : 'No text is available for this document.'}</p>`}
+          <div class="modal-actions">${button('Close', 'close-modal', 'btn primary')}</div>
+        `,
+        'wide-modal'
+      );
     } else if (action === 'change-password') {
       document.querySelectorAll('.user-menu-dropdown').forEach(d => d.classList.add('hidden'));
       showModal(
@@ -3731,7 +3794,19 @@ window.addEventListener('beforeunload', event => {
 document.addEventListener('change', async event => {
   const target = event.target;
   try {
-    if (target.id === 'project-type') {
+    if (target.matches('.upload-zone input[type="file"]')) {
+      // Show which file is selected before it is uploaded.
+      const zone = target.closest('.upload-zone');
+      const file = target.files[0];
+      const tooLarge = file && file.size > 10 * 1024 * 1024;
+      zone.classList.toggle('has-file', Boolean(file) && !tooLarge);
+      zone.classList.toggle('file-error', Boolean(tooLarge));
+      zone.querySelector('[data-upload-title]').textContent = file ? (tooLarge ? 'This file is larger than 10 MB' : 'File selected') : 'Choose evidence file for this project';
+      zone.querySelector('[data-upload-hint]').textContent = file ? 'Click to choose a different file' : 'PDF, Word (.docx), PowerPoint, Excel, CSV, text, or Markdown · up to 10 MB';
+      const label = zone.querySelector('[data-upload-file]');
+      label.hidden = !file;
+      label.innerHTML = file ? `${icon(tooLarge ? 'info' : 'check')}<span>${e(file.name)}</span><small>${size(file.size)}</small>` : '';
+    } else if (target.id === 'project-type') {
       state.type = target.value;
       renderProjectResults();
     } else if (target.id === 'project-status') {
