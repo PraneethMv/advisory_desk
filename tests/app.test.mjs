@@ -1220,6 +1220,123 @@ test('engagement documents are read in the background with page numbers and a st
   }
 });
 
+test('passages keep their page and heading, split at clauses, and never cross a page', async () => {
+  const { chunkPages } = await import('../lib/ai/chunk.mjs');
+  const clause = n => `Clause ${n}. The holder may convert each debenture into equity shares at the conversion price, subject to adjustment for bonus issues and share splits. Interest accrues at 17 percent per annum, of which 9 percent is paid in cash and 8 percent in kind.`;
+  const word = chunkPages([{ page: null, text: `# Term sheet\n\n## Conversion\n\n${[1, 2, 3, 4, 5, 6, 7, 8].map(clause).join('\n\n')}\n\n## Redemption\n\n${clause(9)}\n\nShort note.` }]);
+  assert.deepEqual(word.map(p => p.heading), ['Term sheet › Conversion', 'Term sheet › Conversion', 'Term sheet › Redemption']);
+  assert.ok(word.every(p => p.text.split(/\s+/).length <= 450));
+  assert.match(word[2].text, /Clause 9\.[\s\S]*Short note\.$/, 'A short tail joins the passage before it');
+  // A PDF page has line breaks but no blank lines; passages start at numbered clauses.
+  const pdf = chunkPages([{ page: 3, text: Array.from({ length: 30 }, (_, i) => clause(i + 1)).join('\n') }, { page: 4, text: 'Signed for the issuer.' }]);
+  assert.ok(pdf.length > 3);
+  assert.ok(pdf.filter(p => p.page === 3).every(p => /^Clause \d+\. The holder/.test(p.text)), 'No passage starts mid-clause');
+  assert.deepEqual(pdf.at(-1), { page: 4, heading: '', text: 'Signed for the issuer.' });
+
+  // PDF headings are recognised from short unpunctuated lines and carry onto the next page;
+  // a wrapped line in the middle of a sentence is not mistaken for one.
+  const sectioned = chunkPages([
+    { page: 1, text: 'OCD term sheet\nConversion\nClause 1. The holder may convert each debenture into equity\nshares of the issuer at any time.\nInterest\nClause 2. Interest accrues at 17 percent per annum.' },
+    { page: 2, text: 'Clause 3. Unpaid interest is added to principal.\nRanking\nClause 4. The debentures are unsecured.' }
+  ]);
+  assert.deepEqual(sectioned.map(p => [p.page, p.heading, p.text.split('\n')[0]]), [
+    [1, '', 'OCD term sheet'],
+    [1, 'Conversion', 'Clause 1. The holder may convert each debenture into equity'],
+    [1, 'Interest', 'Clause 2. Interest accrues at 17 percent per annum.'],
+    [2, 'Interest', 'Clause 3. Unpaid interest is added to principal.'],
+    [2, 'Ranking', 'Clause 4. The debentures are unsecured.']
+  ]);
+  // Table rows keep their figures in the passage text instead of becoming headings.
+  const table = chunkPages([{ page: 5, text: 'The schedule below sets out the amounts.\nRevenue 1,234 1,100\nCost of sales 800 750\nGross profit 434 350\nAmounts are in INR million.' }]);
+  assert.equal(table.length, 1); assert.equal(table[0].heading, '');
+  assert.match(table[0].text, /Revenue 1,234 1,100\nCost of sales 800 750\nGross profit 434 350/);
+});
+
+test('documents are split into passages, keyword-indexed, and embedded while AI assistance is on', async () => {
+  const dir = await mkdtemp(resolve('test-results', 'index-'));
+  // Deterministic stand-in embeddings: hashed word counts.
+  const embedAI = {
+    ...fakeAI, embedModel: 'embeddinggemma', fail: '', calls: 0,
+    async embed(inputs) {
+      this.calls++;
+      if (this.fail) throw new Error(this.fail);
+      return inputs.map(text => { const v = new Array(32).fill(0); for (const w of text.toLowerCase().match(/[a-z]+/g) || []) v[[...w].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 32, 7)] += 1; return v; });
+    }
+  };
+  let indexApp = await createApp({ dataDir: dir, aiProvider: embedAI });
+  const listen = async () => { await new Promise(done => indexApp.server.listen(0, '127.0.0.1', done)); return `http://127.0.0.1:${indexApp.server.address().port}/api`; };
+  try {
+    let base = await listen();
+    const owner = { cookie: '', csrf: '' };
+    owner.request = async (path, method = 'GET', value) => {
+      const response = await fetch(`${base}${path}`, { method, headers: { 'Content-Type': 'application/json', ...(owner.cookie ? { Cookie: owner.cookie } : {}), ...(owner.csrf ? { 'X-CSRF-Token': owner.csrf } : {}) }, body: value === undefined ? undefined : JSON.stringify(value) });
+      const cookie = response.headers.get('set-cookie'); if (cookie) owner.cookie = cookie.split(';')[0];
+      const body = await response.json(); if (body.csrf) owner.csrf = body.csrf;
+      return { status: response.status, body };
+    };
+    await owner.request('/auth/signup', 'POST', { name: 'Owner', email: 'owner@example.test', password: 'owner password long enough' });
+    await owner.request('/me/preferences', 'PATCH', { name: 'Owner', employeeId: 'AD-1', designation: 'Manager', acceptUsagePolicy: true });
+    const projectId = (await owner.request('/projects', 'POST', projectInput('Indexing'))).body.project.id;
+    const otherProjectId = (await owner.request('/projects', 'POST', projectInput('Other client'))).body.project.id;
+    const upload = (project, name, text) => owner.request(`/projects/${project}/resources`, 'POST', { name, kind: 'reference', content: Buffer.from(text).toString('base64') });
+    const statusOf = async id => (await owner.request(`/projects/${projectId}`)).body.resources.find(r => r.id === id);
+    const passages = id => indexApp.db.prepare('SELECT * FROM passages WHERE resource_id=? ORDER BY seq').all(id);
+    const keyword = (project, query) => indexApp.db.prepare('SELECT p.resource_id FROM passages_fts f JOIN passages p ON p.id=f.rowid WHERE passages_fts MATCH ? AND p.project_id=?').all(query, project).map(r => r.resource_id);
+
+    const termsId = (await upload(projectId, 'Terms.md', '# Term sheet\n\n## Conversion\n\nThe holder may convert the debentures into equity shares.\n\n## Interest\n\nInterest of 17% is payable, partly in kind.')).body.id;
+    const otherId = (await upload(otherProjectId, 'Other.md', '# Lease\n\nThe lessee may convert the lease into a purchase.')).body.id;
+    await indexApp.extractionIdle();
+
+    // With AI off, passages and the keyword index exist but nothing is embedded.
+    assert.deepEqual(passages(termsId).map(p => [p.heading, p.project_id]), [['Term sheet › Conversion', projectId], ['Term sheet › Interest', projectId]]);
+    assert.equal(embedAI.calls, 0);
+    assert.equal((await statusOf(termsId)).search_status, 'ai_off');
+    assert.deepEqual(keyword(projectId, 'converting'), [termsId], 'Keyword search stems words and stays inside the project');
+    assert.deepEqual(keyword(otherProjectId, 'convert'), [otherId]);
+
+    // Turning AI on embeds every passage with unit-length vectors.
+    assert.equal((await owner.request('/settings/ai', 'PATCH', { enabled: true })).status, 200);
+    await indexApp.extractionIdle();
+    for (const p of passages(termsId)) {
+      assert.equal(p.embed_model, 'embeddinggemma');
+      const v = new Float32Array(p.embedding.buffer.slice(p.embedding.byteOffset, p.embedding.byteOffset + p.embedding.byteLength));
+      assert.ok(Math.abs(Math.hypot(...v) - 1) < 1e-5);
+    }
+    const ready = await statusOf(termsId);
+    assert.equal(ready.search_status, 'searchable'); assert.match(ready.search_note, /2 passages indexed/);
+
+    // If the runtime fails, the document waits and says why; the next change retries.
+    embedAI.fail = 'The local AI runtime is not reachable.';
+    const notesId = (await upload(projectId, 'Notes.md', 'Management expects conversion before the 2028 maturity date.')).body.id;
+    await indexApp.extractionIdle();
+    const waiting = await statusOf(notesId);
+    assert.equal(waiting.search_status, 'indexing'); assert.match(waiting.search_note, /not reachable/);
+    embedAI.fail = '';
+    await owner.request('/settings/ai', 'PATCH', { enabled: true });
+    await indexApp.extractionIdle();
+    assert.equal((await statusOf(notesId)).search_status, 'searchable');
+
+    // Deleting a document removes its passages from both indexes.
+    assert.equal((await owner.request(`/projects/${projectId}/resources/${notesId}`, 'DELETE')).status, 200);
+    assert.equal(passages(notesId).length, 0);
+    assert.deepEqual(keyword(projectId, 'maturity'), []);
+
+    // A new splitting rule rebuilds passages on the next start, and they are embedded again.
+    indexApp.db.prepare("UPDATE settings SET value='0' WHERE key='chunker'").run();
+    const before = passages(termsId).map(p => p.id);
+    await indexApp.close();
+    indexApp = await createApp({ dataDir: dir, aiProvider: embedAI });
+    base = await listen();
+    await indexApp.extractionIdle();
+    assert.notDeepEqual(passages(termsId).map(p => p.id), before);
+    assert.ok(passages(termsId).every(p => p.embed_model === 'embeddinggemma'));
+    assert.equal(indexApp.db.prepare("SELECT value FROM settings WHERE key='chunker'").get().value, String((await import('../lib/ai/chunk.mjs')).CHUNKER_VERSION));
+  } finally {
+    await indexApp.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('Word documents keep headings, tables and paragraph order, and skip deleted text', async () => {
   const { docxText } = await import('../lib/ai/extract.mjs');
   const { deflateRawSync } = await import('node:zlib');

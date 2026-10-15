@@ -168,6 +168,25 @@ function toggleWorkstreamMenu(trigger) {
   openActionsMenu(trigger, `Actions for ${delivery.title}`);
 }
 
+// Engagement Documents row actions share the floating workstream menu.
+function toggleDocumentMenu(trigger) {
+  const wasOpen = workstreamMenuTrigger === trigger && !workstreamMenu.hidden;
+  closeWorkstreamMenu();
+  if (wasOpen) return;
+  const project = state.project?.project;
+  const resource = state.project?.resources?.find(r => r.id === trigger.dataset.id);
+  if (!project || !resource) return;
+  const attrs = `data-id="${e(resource.id)}" data-name="${e(resource.name)}"`;
+  const canDelete = resource.created_by === state.user.id || project.owner_id === state.user.id;
+  workstreamMenu.innerHTML = `
+    <button type="button" role="menuitem" class="workstream-menu-item" data-action="view-text" ${attrs}>${icon('eye')} View extracted text</button>
+    <a role="menuitem" class="workstream-menu-item" data-action="download-document" href="/api/projects/${e(project.id)}/resources/${e(resource.id)}">${icon('download')} Download</a>
+    <button type="button" role="menuitem" class="workstream-menu-item" data-action="move-to-final" ${attrs}>${icon('check')} Move to Final Deliverables</button>
+    ${canDelete ? `<button type="button" role="menuitem" class="workstream-menu-item destructive" data-action="delete-resource" ${attrs}>${icon('trash')} Delete</button>` : ''}
+  `;
+  openActionsMenu(trigger, `Actions for ${resource.name}`);
+}
+
 // Team & access row actions share the floating workstream menu.
 function toggleTeamMenu(trigger) {
   const wasOpen = workstreamMenuTrigger === trigger && !workstreamMenu.hidden;
@@ -1540,26 +1559,6 @@ async function openProject(id, keepTab = false) {
   renderProject();
 }
 
-function resourceRows(resources, compact = false) {
-  const p = state.project.project;
-  if (!resources.length) return empty('Give your project some context.', 'Upload engagement briefs, source documents, or a memo template.', button(icon('upload') + ' Add resources', 'upload-resource', 'btn secondary'));
-  return `
-    <div class="resource-list">
-      ${resources.slice(0, compact ? 4 : undefined).map(r => `
-        <div class="resource-row">
-          <span class="resource-icon">${documentIcon(r)}</span>
-          <div class="resource-name">
-            <strong>${e(r.name)}</strong>
-            <small>${documentKind(r)} <span>·</span> ${size(r.size)} <span>·</span> ${date(r.created)} ${compact ? '' : readStatus(r)}</small>
-          </div>
-          <a class="icon-btn" href="/api/projects/${p.id}/resources/${r.id}" aria-label="Download ${e(r.name)}" title="Download">${icon('download')}</a>
-          ${!compact && (r.created_by === state.user.id || p.owner_id === state.user.id) ? button(icon('trash'), 'delete-resource', 'icon-btn subtle-danger', `data-id="${r.id}" data-name="${e(r.name)}" aria-label="Remove ${e(r.name)}"`) : ''}
-        </div>
-      `).join('')}
-    </div>
-  `;
-}
-
 function renderEngagementSetup(isModal = false) {
   const data = state.project;
   const p = data.project;
@@ -1817,6 +1816,65 @@ function renderProject() {
   // Documents live in Engagement Documents until they are moved to Final Deliverables.
   const documents = data.resources.filter(r => !r.is_final);
   const finalDocuments = data.resources.filter(r => r.is_final);
+  // Engagement Documents table, shown on the Dashboard and the Project Resources tab.
+  const documentsTableBody = !documents.length
+    ? `
+      <div class="empty-list-banner quiet-empty-row">
+        <span class="empty-list-banner-icon quiet-empty-icon-tile">${icon('file')}</span>
+        <span class="empty-list-banner-text">No documents added</span>
+        <button type="button" class="btn outline small-btn quiet-upload-btn" data-action="upload-resource">
+          ${icon('upload')} Upload
+        </button>
+      </div>
+    `
+    : `
+      <div class="resource-list document-table-list">
+        ${documents.map(r => {
+          const creator = data.members?.find(m => m.id === r.created_by)?.name || (r.created_by === state.user.id ? state.user.name : 'Team member');
+          return `
+            <div class="resource-row quiet-data-row engagement-doc-cols">
+              <div class="document-col-name">
+                <input type="checkbox" class="document-select" value="${r.id}" aria-label="Select ${e(r.name)}">
+                <span class="quiet-type-icon tone-blue">${documentIcon(r)}</span>
+                <div class="quiet-name-group">
+                  <strong class="resource-title" title="${e(r.name)}">${e(r.name)}</strong>
+                  <small class="resource-meta">${documentKind(r)}</small>
+                </div>
+              </div>
+              <div class="document-col-size">
+                <code>${size(r.size)}</code>
+              </div>
+              <div class="document-col-author">
+                <span>${e(creator)}</span>
+              </div>
+              <div class="document-col-time">
+                <span class="font-mono text-muted">${formatDateTime(r.created)}</span>
+              </div>
+              <div class="document-col-ai">${readStatus(r)}</div>
+              <div class="workstream-col-action">
+                <button type="button" class="quiet-ghost-action workstream-menu-trigger" data-action="toggle-document-menu" data-id="${r.id}" aria-label="Actions for ${e(r.name)}" aria-haspopup="menu" aria-expanded="false" aria-controls="workstream-actions-menu" title="Document actions">
+                  ${icon('more')}
+                </button>
+              </div>
+            </div>
+          `;
+        }).join('')}
+      </div>
+    `;
+
+  const documentsHtml = `
+    <div class="quiet-table-wrap">
+      <div class="quiet-table-header engagement-doc-cols">
+        <span>DOCUMENT</span>
+        <span class="document-header-size">SIZE</span>
+        <span class="document-header-author">ADDED BY</span>
+        <span class="document-header-time">CREATED TIME</span>
+        <span class="document-header-ai">AI TAG</span>
+        <span class="document-header-action">ACTIONS</span>
+      </div>
+      ${documentsTableBody}
+    </div>
+  `;
   const tabs = [
     ['overview', 'Dashboard'],
     ['resources', 'Project Resources', documents.length],
@@ -1908,62 +1966,6 @@ function renderProject() {
       </div>
     `;
 
-    const documentsTableBody = !documents.length
-      ? `
-        <div class="empty-list-banner quiet-empty-row">
-          <span class="empty-list-banner-icon quiet-empty-icon-tile">${icon('file')}</span>
-          <span class="empty-list-banner-text">No documents added</span>
-          <button type="button" class="btn outline small-btn quiet-upload-btn" data-action="upload-resource">
-            ${icon('upload')} Upload
-          </button>
-        </div>
-      `
-      : `
-        <div class="resource-list document-table-list">
-          ${documents.map(r => {
-            const creator = data.members?.find(m => m.id === r.created_by)?.name || (r.created_by === state.user.id ? state.user.name : 'Team member');
-            return `
-              <div class="resource-row quiet-data-row document-cols">
-                <div class="document-col-name">
-                  <input type="checkbox" class="document-select" value="${r.id}" aria-label="Select ${e(r.name)}">
-                  <span class="quiet-type-icon tone-blue">${documentIcon(r)}</span>
-                  <div class="quiet-name-group">
-                    <strong class="resource-title">${e(r.name)}</strong>
-                    <small class="resource-meta">${documentKind(r)} ${readStatus(r)}</small>
-                  </div>
-                </div>
-                <div class="document-col-size">
-                  <code>${size(r.size)}</code>
-                </div>
-                <div class="document-col-author">
-                  <span>${e(creator)}</span>
-                </div>
-                <div class="document-col-time">
-                  <span class="font-mono text-muted">${formatDateTime(r.created)}</span>
-                </div>
-                <div class="document-col-action">
-                  ${button(icon('eye'), 'view-text', 'quiet-ghost-action', `data-id="${r.id}" aria-label="View text read from ${e(r.name)}" title="View extracted text"`)}
-                  <a class="quiet-ghost-action" href="/api/projects/${p.id}/resources/${r.id}" aria-label="Download ${e(r.name)}" title="Download">${icon('download')}</a>
-                  ${(r.created_by === state.user.id || p.owner_id === state.user.id) ? button(icon('trash'), 'delete-resource', 'quiet-ghost-action subtle-danger', `data-id="${r.id}" data-name="${e(r.name)}" aria-label="Remove ${e(r.name)}" title="Remove document"`) : ''}
-                </div>
-              </div>
-            `;
-          }).join('')}
-        </div>
-      `;
-
-    const documentsHtml = `
-      <div class="quiet-table-wrap">
-        <div class="quiet-table-header document-cols">
-          <span>DOCUMENT</span>
-          <span class="document-header-size">SIZE</span>
-          <span class="document-header-author">ADDED BY</span>
-          <span class="document-header-time">CREATED TIME</span>
-          <span></span>
-        </div>
-        ${documentsTableBody}
-      </div>
-    `;
 
     content = `
       <div class="dashboard-sections">
@@ -2053,9 +2055,14 @@ function renderProject() {
           <h2>Project Resources & Evidence</h2>
           <p>Confidential source documents and memo templates scoped to this project.</p>
         </div>
-        ${button(icon('upload') + ' Upload resource', 'upload-resource', 'btn primary small-btn')}
+        <div class="button-row">
+          <button type="button" class="btn primary small-btn quiet-header-btn" data-action="move-to-final" id="move-to-final-btn" hidden>
+            ${icon('check')} Move to Final Deliverables <span id="move-to-final-count"></span>
+          </button>
+          ${button(icon('upload') + ' Upload resource', 'upload-resource', 'btn primary small-btn')}
+        </div>
       </div>
-      <section class="panel resource-panel">${resourceRows(documents)}</section>
+      <div class="quiet-section-card table-container-card">${documentsHtml}</div>
       <p class="privacy-footnote" style="font-size:11.5px;color:var(--text-muted);display:flex;align-items:center;gap:6px;margin-top:14px;">
         ${icon('lock')} Files are stored in the local SQLite database and strictly scoped to this project. Maximum 10 MB per file.
       </p>
@@ -2119,17 +2126,22 @@ function renderProject() {
   watchReadStatus();
 }
 
-// Whether a document's text has been read for search and AI drafting. Reading happens in the background.
+// How far a document has got towards search and AI drafting: read, then indexed. Both happen in the background.
 const READ_STATUS = {
   pending: ['Reading…', 'pending'],
   ready: ['Text ready', 'ready'],
+  indexing: ['Indexing…', 'pending'],
+  ai_off: ['Text ready', 'muted'],
+  searchable: ['Ready for search', 'ready'],
   needs_review: ['Needs review', 'review'],
   failed: ['Could not read', 'review'],
   unsupported: ['Not searchable yet', 'muted']
 };
+const IN_PROGRESS = ['pending', 'indexing'];
+const docStatus = r => r.search_status || r.extract_status;
 const readStatus = r => {
-  const [label, tone] = READ_STATUS[r.extract_status] || READ_STATUS.pending;
-  return `<span class="read-status read-${tone}" data-read-status="${r.id}" title="${e(r.extract_note || label)}">${label}</span>`;
+  const [label, tone] = READ_STATUS[docStatus(r)] || READ_STATUS.pending;
+  return `<span class="read-status read-${tone}" data-read-status="${r.id}" title="${e(r.search_note || r.extract_note || label)}">${label}</span>`;
 };
 
 // Refreshes the status labels in place until no document on the page is still being read.
@@ -2137,7 +2149,7 @@ let readStatusTimer;
 function watchReadStatus() {
   clearTimeout(readStatusTimer);
   const projectId = state.project?.project.id;
-  if (!state.project?.resources.some(r => r.extract_status === 'pending')) return;
+  if (!state.project?.resources.some(r => IN_PROGRESS.includes(docStatus(r)))) return;
   const stillHere = () => state.page === 'project' && state.project?.project.id === projectId;
   readStatusTimer = setTimeout(async () => {
     if (!stillHere()) return;
@@ -2146,8 +2158,8 @@ function watchReadStatus() {
       if (!stillHere()) return;
       for (const r of fresh.resources) {
         const current = state.project.resources.find(x => x.id === r.id);
-        if (!current || current.extract_status === r.extract_status) continue;
-        Object.assign(current, { extract_status: r.extract_status, extract_note: r.extract_note });
+        if (!current || (docStatus(current) === docStatus(r) && current.search_note === r.search_note)) continue;
+        Object.assign(current, { extract_status: r.extract_status, extract_note: r.extract_note, search_status: r.search_status, search_note: r.search_note });
         document.querySelectorAll(`[data-read-status="${r.id}"]`).forEach(node => { node.outerHTML = readStatus(current); });
       }
     } catch {
@@ -3389,6 +3401,8 @@ document.addEventListener('click', async event => {
       location.hash = '#project-setup';
     } else if (action === 'toggle-workstream-menu') {
       toggleWorkstreamMenu(target);
+    } else if (action === 'toggle-document-menu') {
+      toggleDocumentMenu(target);
     } else if (action === 'toggle-team-menu') {
       toggleTeamMenu(target);
     } else if (action === 'deactivate-user') {
@@ -3623,7 +3637,8 @@ document.addEventListener('click', async event => {
       toast(`Added to Engagement Documents: ${added.name}`);
     } else if (action === 'move-to-final' || action === 'return-to-documents') {
       const toFinal = action === 'move-to-final';
-      const resourceIds = toFinal ? [...document.querySelectorAll('.document-select:checked')].map(box => box.value) : [target.dataset.id];
+      // A row's menu moves that one document; the header button moves the ticked ones.
+      const resourceIds = toFinal && !target.dataset.id ? [...document.querySelectorAll('.document-select:checked')].map(box => box.value) : [target.dataset.id];
       if (!resourceIds.length) return;
       await send(`/projects/${state.project.project.id}/documents/final`, { resourceIds, final: toFinal });
       await reloadCurrent();

@@ -2935,6 +2935,28 @@ tbody td {
   gap: 16px;
 }
 
+/* Engagement Documents: name, size, added by, created, AI tag, actions menu */
+.engagement-doc-cols {
+  grid-template-columns: minmax(180px, 2.2fr) minmax(70px, 0.6fr) minmax(110px, 1fr) minmax(130px, 1.1fr) minmax(120px, 0.9fr) 64px;
+  gap: 16px;
+}
+
+.document-col-ai {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.document-col-ai .read-status {
+  margin-left: 0;
+  white-space: nowrap;
+}
+
+.engagement-doc-cols .workstream-col-action,
+.document-header-action {
+  justify-self: end;
+}
+
 /* Data Rows (Page 6: min 58px, 19px side padding, hairline between rows) */
 .quiet-data-row {
   min-height: 58px;
@@ -3419,6 +3441,9 @@ dialog.modal.toolkit-dialog {
   .document-cols {
     grid-template-columns: minmax(0, 2fr) 80px 110px 62px;
   }
+  .engagement-doc-cols {
+    grid-template-columns: minmax(0, 2fr) 70px 110px 120px 64px;
+  }
 }
 
 @container (max-width: 640px) {
@@ -3439,6 +3464,13 @@ dialog.modal.toolkit-dialog {
   .document-cols {
     grid-template-columns: minmax(0, 1fr) 62px;
     gap: 12px;
+  }
+  .engagement-doc-cols {
+    grid-template-columns: minmax(0, 1fr) auto 40px;
+    gap: 12px;
+  }
+  .document-header-action {
+    visibility: hidden;
   }
 }
 

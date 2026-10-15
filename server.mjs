@@ -9,6 +9,7 @@ import { buildDraft, STANDARD_CATALOG } from './lib/drafts.mjs';
 import { exportDocument } from './lib/exports.mjs';
 import { createOllamaProvider, aiConfigFromEnv } from './lib/ai/provider.mjs';
 import { extractDocument } from './lib/ai/extract.mjs';
+import { chunkPages, CHUNKER_VERSION, passageForEmbedding, vectorToBlob } from './lib/ai/chunk.mjs';
 import { MEMO_GUIDE, DEFAULT_MEMO_HEADINGS, SECTION_STATUSES, COMPLETION_CHECKLIST, allSectionsReady, composeMemo, memoFromBody, normaliseMemo } from './lib/memo.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -207,6 +208,22 @@ export async function createApp(options = {}) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS document_pages (resource_id TEXT NOT NULL REFERENCES resources(id) ON DELETE CASCADE, seq INTEGER NOT NULL, page INTEGER, text TEXT NOT NULL, PRIMARY KEY (resource_id, seq));
     CREATE INDEX IF NOT EXISTS resources_extract ON resources(extract_status);
+    -- Searchable passages cut from document_pages. The FTS5 table indexes their words;
+    -- embedding holds a unit-length float32 vector from the embedding model named in embed_model.
+    CREATE TABLE IF NOT EXISTS passages (id INTEGER PRIMARY KEY, resource_id TEXT NOT NULL REFERENCES resources(id) ON DELETE CASCADE, project_id TEXT NOT NULL, seq INTEGER NOT NULL, page INTEGER, heading TEXT NOT NULL DEFAULT '', text TEXT NOT NULL, embedding BLOB, embed_model TEXT);
+    CREATE INDEX IF NOT EXISTS passages_resource ON passages(resource_id);
+    CREATE INDEX IF NOT EXISTS passages_project ON passages(project_id);
+    CREATE VIRTUAL TABLE IF NOT EXISTS passages_fts USING fts5(heading, text, content='passages', content_rowid='id', tokenize='porter unicode61');
+    CREATE TRIGGER IF NOT EXISTS passages_fts_insert AFTER INSERT ON passages BEGIN
+      INSERT INTO passages_fts(rowid, heading, text) VALUES (new.id, new.heading, new.text);
+    END;
+    CREATE TRIGGER IF NOT EXISTS passages_fts_delete AFTER DELETE ON passages BEGIN
+      INSERT INTO passages_fts(passages_fts, rowid, heading, text) VALUES ('delete', old.id, old.heading, old.text);
+    END;
+    CREATE TRIGGER IF NOT EXISTS passages_fts_update AFTER UPDATE OF heading, text ON passages BEGIN
+      INSERT INTO passages_fts(passages_fts, rowid, heading, text) VALUES ('delete', old.id, old.heading, old.text);
+      INSERT INTO passages_fts(rowid, heading, text) VALUES (new.id, new.heading, new.text);
+    END;
   `);
   // Final Deliverables are documents moved out of Engagement Documents. Workstreams
   // finalised under the earlier model are carried over as exported documents below.
@@ -245,15 +262,75 @@ export async function createApp(options = {}) {
             const insert = db.prepare('INSERT INTO document_pages (resource_id, seq, page, text) VALUES (?,?,?,?)');
             result.pages.forEach((page, seq) => insert.run(row.id, seq, page.page, page.text));
             db.prepare('UPDATE resources SET extract_status=?, extract_note=? WHERE id=?').run(result.status, result.note, row.id);
+            rebuildPassages(row.id);
           });
         }
       } catch (error) {
         if (!stopping) console.error('Document extraction stopped:', error.message);
       }
+      kickIndexing();
     })().finally(() => { extracting = null; });
     return extracting;
   };
+
+  // Passages are cut from a document's pages whenever its text changes. Runs inside a transaction.
+  const rebuildPassages = resourceId => {
+    db.prepare('DELETE FROM passages WHERE resource_id=?').run(resourceId);
+    const resource = db.prepare('SELECT project_id, extract_status FROM resources WHERE id=?').get(resourceId);
+    if (resource?.extract_status !== 'ready') return;
+    const pages = db.prepare('SELECT page, text FROM document_pages WHERE resource_id=? ORDER BY seq').all(resourceId);
+    const insert = db.prepare('INSERT INTO passages (resource_id, project_id, seq, page, heading, text) VALUES (?,?,?,?,?,?)');
+    chunkPages(pages).forEach((passage, seq) => insert.run(resourceId, resource.project_id, seq, passage.page, passage.heading, passage.text));
+  };
+  // A new splitting rule rebuilds every document's passages; documents read before passages existed get theirs.
+  const storedChunker = db.prepare("SELECT value FROM settings WHERE key='chunker'").get()?.value;
+  const unsplit = storedChunker === String(CHUNKER_VERSION)
+    ? db.prepare("SELECT id FROM resources WHERE extract_status='ready' AND NOT EXISTS (SELECT 1 FROM passages p WHERE p.resource_id=resources.id)").all()
+    : db.prepare("SELECT id FROM resources WHERE extract_status='ready'").all();
+  if (unsplit.length || storedChunker !== String(CHUNKER_VERSION)) {
+    transaction(() => {
+      for (const { id } of unsplit) rebuildPassages(id);
+      db.prepare("INSERT INTO settings (key,value) VALUES ('chunker',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(String(CHUNKER_VERSION));
+    });
+  }
+
+  // Embeddings are made in batches by the local embedding model while AI assistance is on. If the
+  // runtime is unreachable, indexing pauses and tries again a minute later.
+  const embedModel = ai.embedModel || 'embeddinggemma';
+  let indexing = null; let indexRetry = null; let indexError = '';
+  const kickIndexing = () => {
+    if (stopping || !getSettings().aiEnabled) return Promise.resolve();
+    indexing ??= (async () => {
+      try {
+        while (!stopping && getSettings().aiEnabled) {
+          const batch = db.prepare('SELECT p.id, p.heading, p.text, r.name FROM passages p JOIN resources r ON r.id=p.resource_id WHERE p.embed_model IS NULL OR p.embed_model<>? ORDER BY p.id LIMIT 16').all(embedModel);
+          if (!batch.length) break;
+          const vectors = await ai.embed(batch.map(p => passageForEmbedding(p.name, p)));
+          if (stopping) break;
+          if (!Array.isArray(vectors) || vectors.length !== batch.length) throw new Error('The embedding model returned an unexpected result.');
+          transaction(() => {
+            // The text check skips a passage that was rebuilt (and its id reused) while this batch ran.
+            const update = db.prepare('UPDATE passages SET embedding=?, embed_model=? WHERE id=? AND text=?');
+            batch.forEach((p, i) => update.run(vectorToBlob(vectors[i]), embedModel, p.id, p.text));
+          });
+          indexError = '';
+        }
+      } catch (error) {
+        indexError = error.message || 'Indexing failed.';
+        if (!stopping) { clearTimeout(indexRetry); indexRetry = setTimeout(kickIndexing, 60000); indexRetry.unref?.(); }
+      }
+    })().finally(() => { indexing = null; });
+    return indexing;
+  };
+  // How far a document has got: read, then split into passages, then embedded for search.
+  const searchStatus = r => {
+    if (r.extract_status !== 'ready') return { search_status: r.extract_status, search_note: r.extract_note };
+    if (!r.unindexed) return { search_status: 'searchable', search_note: r.extract_note || `${r.passage_count} passages indexed for search.` };
+    if (!getSettings().aiEnabled) return { search_status: 'ai_off', search_note: 'Text is ready. Turn on AI assistance in Settings to finish indexing it for search.' };
+    return { search_status: 'indexing', search_note: indexError ? `Waiting for the local AI runtime: ${indexError}` : `Indexing ${r.unindexed} of ${r.passage_count} passages…` };
+  };
   kickExtraction();
+  kickIndexing();
   // One-time password reset codes. The super user (or the reset-password server command) hands
   // the code over directly; the app sends no email. A new code cancels any earlier one.
   const issueResetCode = (userId, issuedBy = null) => {
@@ -395,7 +472,7 @@ export async function createApp(options = {}) {
       const path = new URL(req.url, 'http://localhost').pathname;
       const method = req.method;
       // Any change may have added or edited a document; reading it starts once the response is sent.
-      if (method !== 'GET' && method !== 'HEAD') res.once('finish', kickExtraction);
+      if (method !== 'GET' && method !== 'HEAD') res.once('finish', () => { kickExtraction(); kickIndexing(); });
       const boundAddress = server.address();
       const boundPort = boundAddress && typeof boundAddress === 'object' ? boundAddress.port : 3000;
       const hostName = options.host || process.env.HOST || '127.0.0.1';
@@ -574,7 +651,7 @@ export async function createApp(options = {}) {
         if (!suffix && method === 'GET') {
           respond(res, 200, {
             project,
-            resources: db.prepare('SELECT id,name,kind,size,created,created_by,workstream_id,is_final,extract_status,extract_note FROM resources WHERE project_id=? ORDER BY created DESC').all(project.id),
+            resources: db.prepare('SELECT r.id,r.name,r.kind,r.size,r.created,r.created_by,r.workstream_id,r.is_final,r.extract_status,r.extract_note,(SELECT COUNT(*) FROM passages p WHERE p.resource_id=r.id) AS passage_count,(SELECT COUNT(*) FROM passages p WHERE p.resource_id=r.id AND (p.embed_model IS NULL OR p.embed_model<>?)) AS unindexed FROM resources r WHERE r.project_id=? ORDER BY r.created DESC').all(embedModel, project.id).map(r => ({ ...r, ...searchStatus(r) })),
             deliverables: db.prepare('SELECT id,kind,title,status,created,updated,created_by,is_final FROM deliverables WHERE project_id=? ORDER BY updated DESC').all(project.id),
             members: db.prepare("SELECT u.id,u.name,u.email,u.designation,m.role FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.project_id=? ORDER BY CASE WHEN m.role='Engagement Manager' THEN 1 WHEN m.role='Reviewer' THEN 2 ELSE 3 END, u.name ASC").all(project.id),
             activity: db.prepare('SELECT a.*,u.name AS user_name FROM activity a JOIN users u ON u.id=a.user_id WHERE project_id=? ORDER BY created DESC LIMIT 40').all(project.id)
@@ -899,8 +976,8 @@ export async function createApp(options = {}) {
   server.headersTimeout = 20000;
   return {
     server, db, issueResetCode,
-    extractionIdle: async () => { while (extracting) await extracting; },
-    close: async () => { stopping = true; await new Promise(resolveClose => server.close(resolveClose)); await extracting; db.close(); }
+    extractionIdle: async () => { while (extracting || indexing) await (extracting || indexing); },
+    close: async () => { stopping = true; clearTimeout(indexRetry); await new Promise(resolveClose => server.close(resolveClose)); await extracting; await indexing; db.close(); }
   };
 }
 
