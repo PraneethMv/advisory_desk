@@ -4413,6 +4413,27 @@ textarea {
   color: var(--text-muted);
 }
 
+.auth-link {
+  align-self: center;
+  border: none;
+  background: none;
+  padding: 4px;
+  color: var(--brand-blue);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.auth-link.auth-forgot {
+  align-self: flex-end;
+  margin-top: -6px;
+}
+
+.auth-link:hover {
+  text-decoration: underline;
+}
+
 .password-field .icon-btn:hover {
   background: var(--brand-blue-container);
   color: var(--brand-blue);

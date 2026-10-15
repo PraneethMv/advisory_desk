@@ -31,6 +31,9 @@ Advisory Desk follows a structured, role-aware workflow:
 - **Project Boundary Isolation**: New registrations start with zero project access by default. Confidential client engagements, drafts, and evidence remain invisible until an Engagement Manager / Project Owner assigns the teammate's registered email to that project.
 - **First Account Bootstrap**: The first account registered on `localhost` automatically becomes the workspace **Super User**.
 - **Optional Email-Bound Invitations**: Super users can generate time-limited (7-day), single-use invitation codes for managed corporate provisioning.
+- **Forgot Password**: The app sends no email, so password resets use one-time codes. A super user chooses **Reset password** next to a teammate in **Settings → Team & access** and passes the code on directly; the teammate enters it under **Forgot password?** on the sign-in page with a new password. Codes work once, expire after 24 hours, and a new code cancels any earlier one. A reset signs the account out everywhere else.
+- **Change Password**: Anyone signed in can choose **Change password** in their account menu. It needs the current password and signs out the account's other sessions.
+- **Locked-Out Super User**: If no super user can sign in, run `npm run reset-password -- you@yourfirm.com` on the server computer. It prints a reset code for that account and works only with direct access to the server's data folder.
 
 ### 2. The Gateway Hub (`#hub`)
 - Serves as the post-login launchpad featuring a personalized welcome header (`Welcome Back, <Name>. What do you want to do today?`).
@@ -143,6 +146,7 @@ npm test
 
 The automated test suite runs via Node.js native test runner (`tests/app.test.mjs`), validating:
 - Authentication, open registration, and invitation flows
+- Password reset codes, password changes, and the locked-out super user command
 - Role authorization, CSRF validation, and request origin checks
 - Project and resource isolation across user boundaries
 - Input sanitization and upload validation (rejects invalid dates, traversal paths, and executable files)

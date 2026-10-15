@@ -1073,3 +1073,106 @@ test('AI assistance is off by default; only the super user can switch it and see
   }
   assert.equal((await member.request('/ai/health')).body.status, 'disabled');
 });
+
+test('super users issue one-time password reset codes; users change their own password', async () => {
+  const dir = await mkdtemp(resolve('test-results', 'reset-'));
+  const resetApp = await createApp({ dataDir: dir, aiProvider: fakeAI });
+  try {
+    await new Promise(done => resetApp.server.listen(0, '127.0.0.1', done));
+    const base = `http://127.0.0.1:${resetApp.server.address().port}/api`;
+    const session = () => {
+      const s = { cookie: '', csrf: '' };
+      s.request = async (path, method = 'GET', value) => {
+        const response = await fetch(`${base}${path}`, { method, headers: { 'Content-Type': 'application/json', ...(s.cookie ? { Cookie: s.cookie } : {}), ...(s.csrf ? { 'X-CSRF-Token': s.csrf } : {}) }, body: value === undefined ? undefined : JSON.stringify(value) });
+        const cookie = response.headers.get('set-cookie'); if (cookie) s.cookie = cookie.split(';')[0];
+        const body = await response.json(); if (body.csrf) s.csrf = body.csrf;
+        return { status: response.status, body };
+      };
+      return s;
+    };
+    const profile = { employeeId: 'AD-1', designation: 'Manager', acceptUsagePolicy: true };
+    const owner = session(); const member = session(); const memberLaptop = session();
+    await owner.request('/auth/signup', 'POST', { name: 'Owner', email: 'owner@example.test', password: 'owner password long enough' });
+    await owner.request('/me/preferences', 'PATCH', { name: 'Owner', ...profile });
+    const invite = (await owner.request('/invitations', 'POST', { email: 'member@example.test' })).body.code;
+    const memberId = (await member.request('/auth/signup', 'POST', { name: 'Member', email: 'member@example.test', password: 'member password long enough', invite })).body.user.id;
+    await member.request('/me/preferences', 'PATCH', { name: 'Member', ...profile });
+    await memberLaptop.request('/auth/login', 'POST', { email: 'member@example.test', password: 'member password long enough' });
+    const ownerId = (await owner.request('/me')).body.user.id;
+
+    // Only a super user issues codes, and not for their own account.
+    assert.equal((await member.request(`/team/${ownerId}/password-reset`, 'POST', {})).status, 403);
+    assert.equal((await owner.request(`/team/${ownerId}/password-reset`, 'POST', {})).status, 400);
+    assert.equal((await owner.request('/team/no-such-user/password-reset', 'POST', {})).status, 404);
+
+    const first = (await owner.request(`/team/${memberId}/password-reset`, 'POST', {})).body;
+    assert.equal(first.email, 'member@example.test');
+    assert.ok(first.expires > Date.now() + 23 * 3600000 && first.expires <= Date.now() + 24 * 3600000);
+    assert.equal(resetApp.db.prepare('SELECT COUNT(*) AS n FROM password_resets WHERE token=?').get(first.code).n, 0, 'Codes are stored hashed');
+    const { code } = (await owner.request(`/team/${memberId}/password-reset`, 'POST', {})).body;
+
+    const reset = value => session().request('/auth/reset', 'POST', value);
+    assert.equal((await reset({ email: 'member@example.test', code: first.code, password: 'brand new password here' })).status, 400, 'A newer code cancels the earlier one');
+    assert.equal((await reset({ email: 'owner@example.test', code, password: 'brand new password here' })).status, 400, 'A code only works for its own account');
+    assert.equal((await reset({ email: 'member@example.test', code, password: 'too short' })).status, 400);
+
+    const done = await reset({ email: 'member@example.test', code, password: 'brand new password here' });
+    assert.equal(done.status, 200); assert.equal(done.body.user.email, 'member@example.test');
+    assert.equal((await member.request('/me')).status, 401, 'Existing sessions end after a reset');
+    assert.equal((await memberLaptop.request('/me')).status, 401);
+    assert.equal((await reset({ email: 'member@example.test', code, password: 'another new password' })).status, 400, 'Codes work once');
+    assert.equal((await session().request('/auth/login', 'POST', { email: 'member@example.test', password: 'member password long enough' })).status, 401);
+    assert.equal((await member.request('/auth/login', 'POST', { email: 'member@example.test', password: 'brand new password here' })).status, 200);
+
+    const expired = (await owner.request(`/team/${memberId}/password-reset`, 'POST', {})).body.code;
+    resetApp.db.prepare('UPDATE password_resets SET expires=? WHERE used=0').run(Date.now() - 1);
+    assert.equal((await reset({ email: 'member@example.test', code: expired, password: 'expired code password' })).status, 400);
+
+    const pending = (await owner.request(`/team/${memberId}/password-reset`, 'POST', {})).body.code;
+    assert.equal((await owner.request(`/team/${memberId}`, 'PATCH', { role: 'member', active: false })).status, 200);
+    assert.equal((await reset({ email: 'member@example.test', code: pending, password: 'inactive account password' })).status, 400, 'Inactive accounts cannot be reset');
+    assert.equal((await owner.request(`/team/${memberId}/password-reset`, 'POST', {})).status, 400);
+
+    // Changing your own password needs the current one and signs out other sessions.
+    const ownerPhone = session();
+    await ownerPhone.request('/auth/login', 'POST', { email: 'owner@example.test', password: 'owner password long enough' });
+    assert.equal((await owner.request('/me/password', 'POST', { currentPassword: 'wrong password entirely', newPassword: 'owner replacement password' })).status, 400);
+    assert.equal((await owner.request('/me/password', 'POST', { currentPassword: 'owner password long enough', newPassword: 'owner password long enough' })).status, 400);
+    assert.equal((await owner.request('/me/password', 'POST', { currentPassword: 'owner password long enough', newPassword: 'short' })).status, 400);
+    assert.equal((await owner.request('/me/password', 'POST', { currentPassword: 'owner password long enough', newPassword: 'owner replacement password' })).status, 200);
+    assert.equal((await owner.request('/me')).status, 200, 'The current session stays signed in');
+    assert.equal((await ownerPhone.request('/me')).status, 401);
+    assert.equal((await session().request('/auth/login', 'POST', { email: 'owner@example.test', password: 'owner replacement password' })).status, 200);
+    const demo = session(); await demo.request('/auth/demo', 'POST', {});
+    assert.equal((await demo.request('/me/password', 'POST', { currentPassword: 'x', newPassword: 'demo password long enough' })).status, 403);
+  } finally {
+    await resetApp.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('the reset-password server command issues a code for a locked-out account', async () => {
+  const { execFile } = await import('node:child_process');
+  const dir = await mkdtemp(resolve('test-results', 'cli-'));
+  const run = (...args) => new Promise(done => execFile(process.execPath, ['server.mjs', 'reset-password', ...args], { env: { ...process.env, ADVISORY_DATA_DIR: dir } }, (error, stdout, stderr) => done({ code: error?.code ?? 0, stdout, stderr })));
+  const setup = await createApp({ dataDir: dir, aiProvider: fakeAI });
+  try {
+    await new Promise(done => setup.server.listen(0, '127.0.0.1', done));
+    const base = `http://127.0.0.1:${setup.server.address().port}/api`;
+    const post = (path, value) => fetch(`${base}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) });
+    await post('/auth/signup', { name: 'Owner', email: 'owner@example.test', password: 'forgotten password here' });
+
+    assert.equal((await run()).code, 1);
+    assert.match((await run('nobody@example.test')).stderr, /No account is registered/);
+    const issued = await run('Owner@Example.test');
+    assert.equal(issued.code, 0);
+    const code = /^ {2}(\S+)$/m.exec(issued.stdout)?.[1];
+    assert.ok(code, 'The command prints the code');
+    const reset = await post('/auth/reset', { email: 'owner@example.test', code, password: 'remembered password now' });
+    assert.equal(reset.status, 200);
+    assert.equal((await reset.json()).user.role, 'super_user');
+  } finally {
+    await setup.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

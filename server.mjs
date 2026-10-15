@@ -131,6 +131,7 @@ export async function createApp(options = {}) {
     CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password TEXT NOT NULL, role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, demo INTEGER NOT NULL DEFAULT 0, employee_id TEXT NOT NULL DEFAULT '', designation TEXT NOT NULL DEFAULT '', profile_picture TEXT NOT NULL DEFAULT '', usage_policy_accepted_at TEXT, profile_completed_at TEXT, created TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id TEXT REFERENCES users(id) ON DELETE CASCADE, csrf TEXT NOT NULL, expires INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS invitations (id TEXT PRIMARY KEY, email TEXT NOT NULL, token TEXT UNIQUE NOT NULL, expires INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS password_resets (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, token TEXT UNIQUE NOT NULL, expires INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0, issued_by TEXT, created TEXT NOT NULL, used_at TEXT);
     CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, client TEXT NOT NULL, fy TEXT NOT NULL, type TEXT NOT NULL, gaap TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'Active', owner_id TEXT REFERENCES users(id), created TEXT NOT NULL, updated TEXT NOT NULL, project_type TEXT NOT NULL DEFAULT 'Live', client_id TEXT NOT NULL DEFAULT '', engagement_id TEXT NOT NULL DEFAULT '', estimated_completion TEXT NOT NULL DEFAULT '', sub_type TEXT NOT NULL DEFAULT '');
     CREATE TABLE IF NOT EXISTS memberships (project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, user_id TEXT REFERENCES users(id) ON DELETE CASCADE, role TEXT NOT NULL DEFAULT 'Team Member', PRIMARY KEY(project_id,user_id));
     CREATE TABLE IF NOT EXISTS resources (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, name TEXT NOT NULL, kind TEXT NOT NULL, size INTEGER NOT NULL, content BLOB NOT NULL, text TEXT NOT NULL DEFAULT '', created_by TEXT REFERENCES users(id), created TEXT NOT NULL, workstream_id TEXT DEFAULT NULL);
@@ -216,6 +217,16 @@ export async function createApp(options = {}) {
   const transaction = fn => {
     db.exec('BEGIN IMMEDIATE');
     try { const result = fn(); db.exec('COMMIT'); return result; } catch (error) { db.exec('ROLLBACK'); throw error; }
+  };
+  // One-time password reset codes. The super user (or the reset-password server command) hands
+  // the code over directly; the app sends no email. A new code cancels any earlier one.
+  const issueResetCode = (userId, issuedBy = null) => {
+    const code = randomBytes(18).toString('base64url'); const expires = Date.now() + 24 * 60 * 60 * 1000;
+    transaction(() => {
+      db.prepare('UPDATE password_resets SET used=1 WHERE user_id=? AND used=0').run(userId);
+      db.prepare('INSERT INTO password_resets (id,user_id,token,expires,issued_by,created) VALUES (?,?,?,?,?,?)').run(randomUUID(), userId, hash(code), expires, issuedBy, now());
+    });
+    return { code, expires };
   };
   const exportName = (title, format) => `${title.replace(/[^\p{L}\p{N} _-]/gu, '').replace(/\s+/g, ' ').trim().slice(0, 100) || 'deliverable'}.${format}`;
   // Adds the workstream's Word (memo) or PowerPoint (deck) export to Engagement Documents.
@@ -396,6 +407,20 @@ export async function createApp(options = {}) {
         requireValue(user && correct && user.active, 'Email or password is incorrect, or this account is inactive.', 401);
         signIn(res, user); return;
       }
+      if (path === '/api/auth/reset' && method === 'POST') {
+        throttle(req); const input = await payload(req); const email = emailField(input.email);
+        const code = textField(input.code, 'Reset code', 100); const password = await passwordHash(input.password);
+        const user = transaction(() => {
+          const reset = db.prepare('SELECT r.id AS reset_id, u.* FROM password_resets r JOIN users u ON u.id=r.user_id WHERE r.token=? AND u.email=? AND r.used=0 AND r.expires>? AND u.active=1 AND u.demo=0').get(hash(code), email, Date.now());
+          requireValue(reset, 'This reset code is invalid, already used, or expired. Ask your workspace administrator for a new one.');
+          db.prepare('UPDATE users SET password=? WHERE id=?').run(password, reset.id);
+          db.prepare('UPDATE password_resets SET used=1, used_at=? WHERE id=?').run(now(), reset.reset_id);
+          // Anyone who was signed in to this account is signed out.
+          db.prepare('DELETE FROM sessions WHERE user_id=?').run(reset.id);
+          return reset;
+        });
+        signIn(res, user); return;
+      }
       if (path === '/api/auth/demo' && method === 'POST') {
         throttle(req); requireValue(allowDemo && ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress), 'Sample workspaces are only available on localhost.', 403);
         const user = { id: randomUUID(), name: 'Alex Morgan', email: `sample-${randomUUID()}@advisory.local`, role: 'member', demo: 1 };
@@ -426,6 +451,20 @@ export async function createApp(options = {}) {
       if (path === '/api/auth/logout' && method === 'POST') {
         db.prepare('DELETE FROM sessions WHERE csrf=? AND user_id=?').run(user.csrf, user.id);
         respond(res, 200, { ok: true }, { 'Set-Cookie': `advisory_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secureCookie ? '; Secure' : ''}` }); return;
+      }
+      if (path === '/api/me/password' && method === 'POST') {
+        requireValue(!user.demo, 'Sample users do not have a password.', 403);
+        throttle(req); const input = await payload(req);
+        requireValue(await passwordMatches(input.currentPassword, user.password), 'Your current password is incorrect.');
+        requireValue(input.newPassword !== input.currentPassword, 'Choose a password different from your current one.');
+        const password = await passwordHash(input.newPassword);
+        transaction(() => {
+          db.prepare('UPDATE users SET password=? WHERE id=?').run(password, user.id);
+          db.prepare('UPDATE password_resets SET used=1 WHERE user_id=? AND used=0').run(user.id);
+          // Other signed-in sessions end; this one stays.
+          db.prepare('DELETE FROM sessions WHERE user_id=? AND csrf<>?').run(user.id, user.csrf);
+        });
+        respond(res, 200, { ok: true }); return;
       }
       requireValue(user.demo || user.profile_completed_at, 'Complete user settings and accept the usage policy to continue.', 403);
       if (path === '/api/projects' && method === 'GET') {
@@ -471,6 +510,14 @@ export async function createApp(options = {}) {
         const code = randomBytes(18).toString('base64url'); const expires = Date.now() + 7 * 86400000;
         transaction(() => { db.prepare('UPDATE invitations SET used=1 WHERE email=? AND used=0').run(email); db.prepare('INSERT INTO invitations VALUES (?,?,?,?,?,?)').run(randomUUID(), email, hash(code), expires, 0, now()); });
         respond(res, 201, { code, email, expires }); return;
+      }
+      const resetMatch = /^\/api\/team\/([\w-]+)\/password-reset$/.exec(path);
+      if (resetMatch && method === 'POST') {
+        adminOnly(user);
+        requireValue(resetMatch[1] !== user.id, 'Use Change password in your account menu for your own account.');
+        const target = db.prepare('SELECT * FROM users WHERE id=? AND demo=0').get(resetMatch[1]); requireValue(target, 'Team member not found.', 404);
+        requireValue(target.active, 'Reactivate this account before issuing a reset code.');
+        respond(res, 201, { ...issueResetCode(target.id, user.id), email: target.email, name: target.name }); return;
       }
       const teamMatch = /^\/api\/team\/([\w-]+)$/.exec(path);
       if (teamMatch && method === 'PATCH') {
@@ -807,10 +854,25 @@ export async function createApp(options = {}) {
   });
   server.requestTimeout = 120000;
   server.headersTimeout = 20000;
-  return { server, db, close: async () => { await new Promise(resolveClose => server.close(resolveClose)); db.close(); } };
+  return { server, db, issueResetCode, close: async () => { await new Promise(resolveClose => server.close(resolveClose)); db.close(); } };
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// Recovery when nobody can sign in to issue a code, e.g. the only super user forgot their password.
+// It runs on the server computer only: `node server.mjs reset-password you@firm.com`.
+async function resetPasswordCommand(email) {
+  const app = await createApp();
+  try {
+    const target = email && app.db.prepare('SELECT id, name, active FROM users WHERE email=? AND demo=0').get(email.trim().toLowerCase());
+    if (!target) { console.error(email ? `No account is registered with ${email}.` : 'Usage: node server.mjs reset-password <email>'); process.exitCode = 1; return; }
+    if (!target.active) { console.error(`${target.name}'s account is inactive. A super user must reactivate it first.`); process.exitCode = 1; return; }
+    const { code, expires } = app.issueResetCode(target.id);
+    console.log(`Password reset code for ${target.name}:\n\n  ${code}\n\nOn the sign-in page, choose "Forgot password?" and enter this code with a new password.\nIt works once and expires ${new Date(expires).toLocaleString()}.`);
+  } finally { await app.close(); }
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url) && process.argv[2] === 'reset-password') {
+  await resetPasswordCommand(process.argv[3]);
+} else if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const app = await createApp(); const host = process.env.HOST || '127.0.0.1'; const port = Number(process.env.PORT || 3000);
   app.server.listen(port, host, () => console.log(`Advisory Desk alpha: http://${host}:${port}\nData is stored locally. AI assistance uses a local model and is off until enabled in Settings. First registered team account becomes the super user.`));
   for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, async () => { await app.close(); process.exit(0); });

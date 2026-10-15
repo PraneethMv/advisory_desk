@@ -234,6 +234,12 @@ function userMenuDropdown() {
           <span class="theme-icon-indicator">${isDark ? icon('sun') : icon('moon')}</span>
           <span class="theme-toggle-label">${isDark ? 'Switch to Light mode' : 'Switch to Dark mode'}</span>
         </button>
+        ${state.user.demo ? '' : `
+          <button type="button" class="user-menu-item" data-action="change-password">
+            ${icon('lock')}
+            <span>Change password</span>
+          </button>
+        `}
         <div class="user-menu-divider"></div>
         <button type="button" class="user-menu-item user-menu-danger" data-action="logout">
           ${icon('logout')}
@@ -553,14 +559,42 @@ async function boot() {
    Open sign-up allowed; project access is managed by Engagement Managers.
    ========================================================================== */
 
+// Forgot password: the super user issues a one-time code from Settings → Team & access.
+function resetPasswordForm() {
+  return `
+    <form id="auth-form" class="form-stack">
+      <label class="auth-field">Work email
+        <input type="email" name="email" autocomplete="email" placeholder="you@yourfirm.com" required maxlength="254" autofocus>
+      </label>
+      <label class="auth-field">Reset code
+        <input name="code" autocomplete="one-time-code" placeholder="Code from your workspace administrator" required maxlength="100">
+      </label>
+      <label class="auth-field">New password
+        <div class="password-field">
+          <input type="password" name="password" autocomplete="new-password" placeholder="At least 12 characters" minlength="12" maxlength="128" required>
+          <button type="button" class="icon-btn" data-action="toggle-password" aria-label="Show password">${icon('eye')}</button>
+        </div>
+      </label>
+      <div class="inline-note">
+        ${icon('lock')}
+        <span>Don't have a code? Ask your workspace super user to issue one from Settings. Codes work once and expire after 24 hours.</span>
+      </div>
+      <div class="form-error" role="alert"></div>
+      <button class="btn primary auth-submit" type="submit">Set new password ${icon('arrow')}</button>
+      <button type="button" class="auth-link" data-action="auth-tab" data-tab="login">Back to sign in</button>
+    </form>
+  `;
+}
+
 function renderAuth() {
   const signup = state.authTab === 'signup';
+  const reset = state.authTab === 'reset';
   const first = state.authStatus.needsSetup;
   const isDark = state.theme === 'dark';
 
   app.innerHTML = `
     <main class="auth-page">
-      <section class="auth-card" aria-label="${signup ? 'Create account' : 'Sign in'}">
+      <section class="auth-card" aria-label="${signup ? 'Create account' : reset ? 'Reset password' : 'Sign in'}">
         <header class="auth-header">
           <a class="brand" href="#auth">
             <span class="brand-mark">a<span>↗</span></span>
@@ -576,12 +610,13 @@ function renderAuth() {
 
         <div class="auth-title-block">
           <span class="auth-kicker">${first ? 'Workspace setup' : 'Private advisory workspace'}</span>
-          <h1>${signup ? (first ? 'Initialize workspace' : 'Create account') : 'Welcome back'}</h1>
+          <h1>${signup ? (first ? 'Initialize workspace' : 'Create account') : reset ? 'Reset password' : 'Welcome back'}</h1>
           <p>
-          ${signup ? 'Create your account using existing firm credentials or select SSO (Coming Soon).' : 'Sign in to access your assigned client projects and deliverables.'}
+          ${signup ? 'Create your account using existing firm credentials or select SSO (Coming Soon).' : reset ? 'Enter the reset code from your workspace administrator and choose a new password.' : 'Sign in to access your assigned client projects and deliverables.'}
           </p>
         </div>
 
+        ${reset ? resetPasswordForm() : `
         <div class="auth-tabs" role="tablist" aria-label="Authentication mode">
           <button type="button" role="tab" aria-selected="${!signup}" data-action="auth-tab" data-tab="login" class="${!signup ? 'active' : ''}">Sign in</button>
           <button type="button" role="tab" aria-selected="${signup}" data-action="auth-tab" data-tab="signup" class="${signup ? 'active' : ''}">Create account</button>
@@ -602,7 +637,8 @@ function renderAuth() {
               <button type="button" class="icon-btn" data-action="toggle-password" aria-label="Show password">${icon('eye')}</button>
             </div>
           </label>
-          
+          ${!signup && !first ? '<button type="button" class="auth-link auth-forgot" data-action="auth-tab" data-tab="reset">Forgot password?</button>' : ''}
+
           ${signup && !first ? `
             ${state.authStatus.requireInvite ? `
               <label class="auth-field">Team invitation code
@@ -634,8 +670,9 @@ function renderAuth() {
             ${signup ? (first ? 'Initialize workspace' : 'Create account') : 'Sign in'} ${icon('arrow')}
           </button>
         </form>
+        `}
 
-        ${state.authStatus.allowDemo ? `
+        ${state.authStatus.allowDemo && !reset ? `
           <div class="auth-divider">
             <span>or explore instant demo</span>
           </div>
@@ -2203,7 +2240,10 @@ async function renderSettings() {
               <label style="display:flex;flex-direction:row;align-items:center;gap:6px;font-size:12px;">
                 <input type="checkbox" name="active" ${u.active ? 'checked' : ''} ${u.id === state.user.id ? 'disabled' : ''}> Active
               </label>
-              ${u.id !== state.user.id ? '<button type="submit" class="btn secondary small-btn">Save</button>' : '<span class="role-tag">Super user</span>'}
+              ${u.id !== state.user.id ? `
+                ${u.active ? button(`${icon('lock')} Reset password`, 'issue-reset', 'btn secondary small-btn', `data-id="${u.id}" data-name="${e(u.name)}"`) : ''}
+                <button type="submit" class="btn secondary small-btn">Save</button>
+              ` : '<span class="role-tag">Super user</span>'}
               <div class="form-error" role="alert" style="width:100%;"></div>
             </form>
           `).join('')}
@@ -3501,11 +3541,50 @@ document.addEventListener('click', async event => {
         'remove-member-form',
         `data-id="${target.dataset.id}"`
       );
+    } else if (action === 'change-password') {
+      document.querySelectorAll('.user-menu-dropdown').forEach(d => d.classList.add('hidden'));
+      showModal(
+        'Change password',
+        'Other devices signed in to your account will be signed out.',
+        `
+          <form id="password-form" class="form-stack">
+            <label>Current password
+              <input type="password" name="currentPassword" autocomplete="current-password" maxlength="128" required autofocus>
+            </label>
+            <label>New password
+              <input type="password" name="newPassword" autocomplete="new-password" placeholder="At least 12 characters" minlength="12" maxlength="128" required>
+            </label>
+            <label>Confirm new password
+              <input type="password" name="confirmPassword" autocomplete="new-password" minlength="12" maxlength="128" required>
+            </label>
+            ${modalActions('Update password')}
+          </form>
+        `
+      );
+    } else if (action === 'issue-reset') {
+      const result = await send(`/team/${target.dataset.id}/password-reset`, {});
+      showModal(
+        `Reset code for ${result.name}`,
+        'Share this code with them directly, e.g. in person or by phone. It is shown only once.',
+        `
+          <div class="form-stack">
+            <div style="display:flex;gap:10px;align-items:center;">
+              <input id="reset-code" value="${e(result.code)}" readonly style="font-family:var(--font-mono);font-size:13px;flex:1;" aria-label="Reset code">
+              ${button('Copy code', 'copy-invite', 'btn secondary small-btn', 'data-input="reset-code"')}
+            </div>
+            <div class="inline-note">
+              ${icon('info')}
+              <span>${e(result.email)} enters it under <strong>Forgot password?</strong> on the sign-in page. It works once, expires ${e(new Date(result.expires).toLocaleString())}, and cancels any earlier code.</span>
+            </div>
+            <div class="modal-actions">${button('Done', 'close-modal', 'btn primary')}</div>
+          </div>
+        `
+      );
     } else if (action === 'copy-invite') {
-      const input = document.querySelector('#invitation-code');
+      const input = document.querySelector(`#${target.dataset.input || 'invitation-code'}`);
       try {
         await navigator.clipboard.writeText(input.value);
-        toast('Invitation code copied to clipboard.');
+        toast(target.dataset.input ? 'Reset code copied to clipboard.' : 'Invitation code copied to clipboard.');
       } catch {
         input.focus();
         input.select();
@@ -3688,17 +3767,19 @@ document.addEventListener('submit', async event => {
 
   try {
     if (form.id === 'auth-form') {
-      setSession(await send(`/auth/${state.authTab}`, values));
+      const mode = state.authTab;
+      setSession(await send(`/auth/${mode}`, values));
       state.busy = false;
-      if (state.authTab === 'signup' || (!state.user.demo && !state.user.profileComplete)) {
+      if (mode === 'reset') state.authTab = 'login';
+      if (mode === 'signup' || (!state.user.demo && !state.user.profileComplete)) {
         location.hash = '#preferences';
         renderPreferences();
-        toast(state.authTab === 'signup' ? 'Account created. Complete your preferences to continue.' : 'Complete your preferences to continue.');
+        toast(mode === 'signup' ? 'Account created. Complete your preferences to continue.' : 'Complete your preferences to continue.');
       } else {
         await refreshWorkspace();
         location.hash = '#hub';
         renderHub();
-        toast('Signed in successfully.');
+        toast(mode === 'reset' ? 'Password updated. You are signed in.' : 'Signed in successfully.');
       }
     } else if (form.id === 'preferences-form') {
       const file = data.get('profilePicture');
@@ -3840,6 +3921,11 @@ document.addEventListener('submit', async event => {
         </div>
       `;
       toast('Invitation code generated.');
+    } else if (form.id === 'password-form') {
+      if (values.newPassword !== values.confirmPassword) throw new Error('The new passwords do not match.');
+      await send('/me/password', { currentPassword: values.currentPassword, newPassword: values.newPassword });
+      finishModal();
+      toast('Password updated.');
     } else if (form.dataset.form === 'team-update') {
       await send(`/team/${form.dataset.id}`, { role: values.role, active: data.has('active') }, 'PATCH');
       state.busy = false;
